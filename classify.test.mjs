@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, handPose, assignHands, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -132,4 +132,25 @@ ids.observe(5, sa, new Set([2])); ids.observe(5, sa, new Set([2])); assert.equal
 assert.equal(ids.merged(), 1);
 ids.observe(6, sa, new Set([1])); ids.observe(6, sa, new Set([1])); assert.equal(ids.id(6), 6); // look-alike while person 1 is in view: not merged
 assert.equal(ids.match(sb), 2); // head alone, no body box
+// Hands: world landmarks in meters, wrist at the origin, fingers pointing up (-y), palm facing the camera (+z).
+const hand = finger => {
+  const w = Array.from({ length: 21 }, () => ({ x: 0, y: 0, z: 0 }));
+  [-.03, -.01, .01, .03].forEach((x, f) => { const [m, p, d, t] = [5, 6, 7, 8].map(i => i + 4 * f); Object.assign(w, finger(x, m, p, d, t)); });
+  w[1] = { x: -.03, y: -.02, z: 0 }; w[2] = { x: -.05, y: -.04, z: 0 }; w[3] = { x: -.06, y: -.06, z: 0 }; w[4] = { x: -.07, y: -.08, z: 0 }; // thumb out to the side
+  return w;
+};
+const openHand = hand((x, m, p, d, t) => ({ [m]: { x, y: -.08, z: 0 }, [p]: { x, y: -.11, z: 0 }, [d]: { x, y: -.13, z: 0 }, [t]: { x, y: -.15, z: 0 } }));
+const fist = hand((x, m, p, d, t) => ({ [m]: { x, y: -.08, z: 0 }, [p]: { x, y: -.1, z: .02 }, [d]: { x, y: -.08, z: .03 }, [t]: { x, y: -.05, z: .02 } }));
+const grip = hand((x, m, p, d, t) => ({ [m]: { x, y: -.08, z: 0 }, [p]: { x, y: -.1, z: .03 }, [d]: { x, y: -.09, z: .06 }, [t]: { x, y: -.07, z: .07 } })); // around a ~7 cm bottle
+assert.equal(handPose(openHand), "Open hand");
+assert.equal(handPose(fist), "Fist");
+assert.equal(handPose(grip), "Holding"); // curled but the fingertips stay away from the palm
+assert.equal(handPose(fist, { holding: true }), "Holding"); // tight grip on something thin the classifier sees
+assert.equal(handPose(fist, { gesture: "Thumb_Up" }), "Thumbs up");
+assert.equal(handPose(openHand, { gesture: "Closed_Fist" }), "Open hand"); // the recognizer's fist is decided by the geometry
+const pinch = openHand.map((q, i) => i === 4 ? { ...openHand[8], x: openHand[8].x - .01 } : q);
+assert.equal(handPose(pinch, { holding: true }), "Holding"); // pen between thumb and index
+assert.equal(handPose(openHand, { holding: true }), "Open hand"); // object in front of an open hand is not held
+const person = body(base);
+assert.deepEqual(assignHands([[{ x: .62, y: .5 }], [{ x: .38, y: .47 }], [{ x: .9, y: .9 }]], [person]), [{ pose: 0, side: "right" }, { pose: 0, side: "left" }, null]);
 console.log("all checks passed");

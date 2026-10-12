@@ -88,7 +88,7 @@
 <script type="module">
 const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14", MODELS = "https://storage.googleapis.com/mediapipe-models";
 const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist", YOLO_SIZE = 640;
-const WINDOW_MS = 1500, HELD_COLOR = "#34d399", HELD_MIN = 0.15, PEOPLE_COLOR = "#a78bfa", PERSON_COLORS = ["#22d3ee", "#60a5fa", "#e879f9", "#facc15"], LIMB_COLORS = ["#22d3ee", "#f472b6", "#a3e635", "#fbbf24"];
+const WINDOW_MS = 1500, HELD_COLOR = "#34d399", HAND_COLOR = "#fb923c", HELD_MIN = 0.15, PEOPLE_COLOR = "#a78bfa", PERSON_COLORS = ["#22d3ee", "#60a5fa", "#e879f9", "#facc15"], LIMB_COLORS = ["#22d3ee", "#f472b6", "#a3e635", "#fbbf24"];
 const EXPR_COLORS = { Smiling: "#a3e635", Threatening: "#f43f5e", Surprised: "#fbbf24", Sad: "#60a5fa", Neutral: "#22d3ee" };
 const TORSO = [[11, 12], [12, 24], [24, 23], [23, 11]].map(([start, end]) => ({ start, end }));
 const $ = id => document.getElementById(id);
@@ -114,10 +114,10 @@ try {
   // Browsers block loading classify.js from file://, which used to leave the page silently stuck.
   if (location.protocol === "file:") throw new Error("don't open index.html directly. Double-click start.bat (or run: node server.mjs) and use http://localhost:8080");
   // Dynamic imports so a failed download shows an error instead of hanging.
-  const { PoseLandmarker, FaceLandmarker, FilesetResolver, DrawingUtils } = await import(CDN);
+  const { PoseLandmarker, FaceLandmarker, GestureRecognizer, FilesetResolver, DrawingUtils } = await import(CDN);
   const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = `${ORT}/`;
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds } = await import("./classify.js");
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands } = await import("./classify.js");
   const bctx = bodyCv.getContext("2d"), fctx = faceCv.getContext("2d"), bdraw = new DrawingUtils(bctx), fdraw = new DrawingUtils(fctx);
 
   const vision = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
@@ -132,6 +132,9 @@ try {
   const pose = await load(PoseLandmarker, "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", { numPoses: PERSON_COLORS.length });
   status.textContent = "Loading face model…";
   const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 4, outputFaceBlendshapes: true });
+  status.textContent = "Loading hand model…";
+  // 21 points per hand (3D, in meters) plus named gestures; fist vs holding is decided in handPose from the finger geometry.
+  const gestures = await load(GestureRecognizer, "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task", { numHands: 4 });
   status.textContent = "Loading object model…";
   // YOLO26 nano (Ultralytics, AGPL-3.0; same model as SharpAI/DeepCamera): people and objects.
   // Graphics card (WebGPU) first, then CPU. The warm-up run proves the backend really works on this device
@@ -164,7 +167,7 @@ try {
   }
 
   const FS = faceCv.width, expr = {}, recCv = document.createElement("canvas"), rctx = recCv.getContext("2d");
-  let W = 0, H = 0, track, people, heads, rec = null, frames = 0, fpsT = performance.now(), source = 0, tick = 0, faceRes = null, detecting = false, found = [], crowd = [];
+  let W = 0, H = 0, track, people, heads, rec = null, frames = 0, fpsT = performance.now(), source = 0, tick = 0, faceRes = null, handRes = null, detecting = false, found = [], crowd = [];
   const X = px => mirrored ? W - px : px; // video pixel x → screen x
   const seen = () => people.total() - heads.merged(); // returning people are not counted twice
   // Person id of a head: through the body box around it, or from the head alone when no body is detected (e.g. behind a desk).
@@ -224,8 +227,19 @@ try {
       hudText(bctx, `ID ${heads.id(t.id)} · ${Math.round(t.score * 100)}%`, x + 4, y + h - 8, PEOPLE_COLOR);
     }
     hudText(bctx, `PEOPLE ${crowd.length} · TOTAL ${seen()}`, W - 50, 36, PEOPLE_COLOR, "bold 16px Orbitron, sans-serif", "right");
+    // Hands: each goes to the person whose wrist it is; the first person's hands also know what the object classifier sees in them.
+    const hands = handRes?.landmarks ?? [], owners = assignHands(hands, res.landmarks);
+    const handStates = hands.map((lm, i) => {
+      const o = owners[i], h = o?.pose === 0 && enabled.objects ? held[o.side] : null, obj = h?.label && h.score >= HELD_MIN ? h.label : null;
+      const state = handPose(handRes.worldLandmarks[i], { gesture: handRes.gestures[i]?.[0]?.categoryName, holding: !!obj });
+      return { lm, o, text: state === "Holding" && obj ? `Holding ${pretty(obj)}` : state };
+    });
+    for (const h of handStates) {
+      view(bctx, W); bdraw.drawConnectors(h.lm, GestureRecognizer.HAND_CONNECTIONS, { color: HAND_COLOR, lineWidth: 2 });
+      hudText(bctx, h.text.toUpperCase(), X(h.lm[0].x * W), h.lm[0].y * H + 24, HAND_COLOR, "bold 14px Orbitron, sans-serif", "center");
+    }
     const cards = [`<div class="card" style="border-color:${PEOPLE_COLOR}"><div class="row"><span>People in frame <b style="color:${PEOPLE_COLOR}">${crowd.length}</b></span><span class="k">Total seen ${seen()}</span></div></div>`];
-    for (const p of track(res.landmarks, now)) {
+    for (const [k, p] of track(res.landmarks, now).entries()) { // same order as res.landmarks
       p.hist ??= []; p.speed ??= 0;
       p.squats ??= makeRepCounter("Squat", "Standing"); p.jumps ??= makeRepCounter("Jumping");
       p.speed = 0.8 * p.speed + 0.2 * motion(p.hist.at(-1)?.lm, p.lm); // smoothed so jitter doesn't flip the label
@@ -254,6 +268,7 @@ try {
       cards.push(`<div class="card" style="border-color:${color}">
         <div class="row"><span>#${id} <b style="color:${color}">${label}</b></span><span class="k">${p.speed > 0.01 ? "Moving" : "Still"} · Squats ${squats} · Jumps ${jumps}</span></div>
         ${limbs.map((l, i) => `<div class="row"><span style="color:${LIMB_COLORS[i]}">${l.name}</span><span>${l.visible ? l.deg + "°" : "--"} ${l.state}</span></div>`).join("")}
+        ${handStates.filter(h => h.o?.pose === k).map(h => `<div class="row"><span style="color:${HAND_COLOR}">${h.o.side === "left" ? "Left" : "Right"} hand</span><span>${h.text}</span></div>`).join("")}
       </div>`);
     }
     hudFrame(bctx, W, H, "#22d3ee");
@@ -418,6 +433,8 @@ try {
     firstPose = bodyRes.landmarks[0] ?? null;
     tick++;
     if (enabled.objects && heldOk && tick % 4 === 1) classifyNext();
+    // The hand model runs on the frames the face model skips.
+    handRes = !enabled.body ? null : tick % 2 === 1 || !handRes ? gestures.recognizeForVideo(video, now) : handRes;
     drawBody(now, bodyRes);
     // The face model runs every other frame (~15/s still looks smooth) so the object detector gets more of the graphics card.
     if (enabled.face && (tick % 2 === 0 || !faceRes)) observeHeads(faceRes = face.detectForVideo(video, now));

@@ -225,6 +225,43 @@ export function faceCrop(lm, W, H, pad = 1.4) {
   return { sx: (x0 + x1) / 2 * W - size / 2, sy: (y0 + y1) / 2 * H - size / 2, size, cx: (x0 + x1) / 2 * W, cy: (y0 + y1) / 2 * H };
 }
 
+// Which person's hand it is: the nearest pose wrist, as {pose index, side} (pose sides are the person's own left/right).
+// MediaPipe's handedness label isn't used: it assumes a mirrored image, and video files aren't mirrored.
+export function assignHands(hands, poses, maxDist = 0.12) {
+  return hands.map(h => {
+    let best = null, bd = maxDist;
+    poses.forEach((p, pose) => {
+      for (const side of ["left", "right"]) {
+        const w = p[side === "left" ? L.lWr : L.rWr], d = Math.hypot(w.x - h[0].x, w.y - h[0].y);
+        if (d < bd) { bd = d; best = { pose, side }; }
+      }
+    });
+    return best;
+  });
+}
+
+// Hand state from MediaPipe hand world landmarks (21 points in meters, so thresholds hold at any distance from the camera).
+// A curled hand is a fist when the fingertips close onto the palm, and holding something when they stay apart, wrapped
+// around it; `holding` (an object seen in that hand) also tells a pen pinch from an empty "OK" sign.
+// shortcut: FIST_GAP is a hand-tuned average adult hand; calibrate on real hands if fists read as holding or the reverse.
+const FINGERS = [[5, 6, 8], [9, 10, 12], [13, 14, 16], [17, 18, 20]], FIST_GAP = 0.045; // MCP, PIP, tip of index…pinky; m
+const GESTURES = { Open_Palm: "Open hand", Pointing_Up: "Pointing", Thumb_Up: "Thumbs up", Thumb_Down: "Thumbs down", Victory: "Victory", ILoveYou: "I love you" };
+const d3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+const angle3 = (a, b, c) => {
+  const u = [a.x - b.x, a.y - b.y, a.z - b.z], v = [c.x - b.x, c.y - b.y, c.z - b.z];
+  return Math.acos(Math.max(-1, Math.min(1, (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (Math.hypot(...u) * Math.hypot(...v) || 1e-9)))) * 180 / Math.PI;
+};
+export function handPose(w, { gesture = "None", holding = false } = {}) {
+  const palm = [0, 5, 9, 13, 17].reduce((s, i) => ({ x: s.x + w[i].x / 5, y: s.y + w[i].y / 5, z: s.z + w[i].z / 5 }), { x: 0, y: 0, z: 0 });
+  const curled = FINGERS.filter(([m, p, t]) => angle3(w[m], w[p], w[t]) < 120).length;
+  const gap = FINGERS.reduce((s, [, , t]) => s + d3(w[t], palm), 0) / FINGERS.length;
+  const named = GESTURES[gesture];
+  if (named && !holding) return named; // thumbs up and pointing are curled hands too, so the recognizer's names come first
+  if (curled >= 3) return gap < FIST_GAP && !holding ? "Fist" : "Holding";
+  if (holding && (d3(w[4], w[8]) < 0.03 || curled >= 2)) return "Holding"; // pinch grip (pen) or a loose grip
+  return named ?? (curled === 0 ? "Open hand" : "Relaxed");
+}
+
 // Square crop around one hand from pose landmarks, in video pixels, for classifying what the hand holds.
 // Centered past the wrist toward the index knuckle; sized from the forearm so it scales with distance from the camera.
 const HAND = { left: [L.lEl, L.lWr, 19], right: [L.rEl, L.rWr, 20] };

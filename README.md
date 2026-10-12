@@ -3,6 +3,7 @@
 Real-time body, face and object recognition in the browser, with a futuristic HUD.
 
 - **Body:** up to 4 people, each limb tracked with joint angles; posture (standing, squat, T-pose, hands up), walking, jumping, squat and jump counters.
+- **Hands:** up to 4 hands, each with its 21 finger points and a state: fist, holding something (with the object's name when the classifier recognizes it), open hand, pointing, thumbs up/down, victory, I love you. A curled hand counts as a fist when the fingertips close onto the palm, and as holding when they stay apart around an object.
 - **Face:** eyes, irises, eyebrows and mouth; expression (smiling, threatening, surprised, sad, neutral), eyes open/closed/winking, mouth open/closed.
 - **People counter:** a box and a stable ID for every person in view, with "in frame" and "total seen" counts. IDs survive brief occlusions, and one-frame false detections aren't counted.
 - **Objects:** 80 everyday object types (cup, phone, laptop, bottle, chair…) with YOLO26 nano, the model used by [SharpAI/DeepCamera](https://github.com/SharpAI/DeepCamera). It runs on the graphics card through WebGPU when the browser supports it, otherwise on the processor.
