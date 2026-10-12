@@ -260,6 +260,30 @@ try {
     $("bodyOut").innerHTML = cards.join("");
   }
 
+  // DeepFace (optional, Python): age, gender and emotion from deepface_server.py on this PC. Without it the page works as before.
+  // The face in the panel is sent about once a second, one request at a time; while offline it retries every 10 s.
+  const DEEPFACE = "http://127.0.0.1:5005/analyze", dfCv = Object.assign(document.createElement("canvas"), { width: 224, height: 224 }), dctx = dfCv.getContext("2d");
+  const df = { state: "checking", busy: false, last: -Infinity, face: null };
+  const word = s => String(s).replace(/[^\w -]/g, ""); // server text goes into innerHTML
+  async function deepAnalyze(img) {
+    const r = await fetch(DEEPFACE, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ img }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    return { age: Math.round(Number(j.age)), gender: word(j.gender), emotion: word(j.emotion) };
+  }
+  function deepFaceTick(lm) {
+    const now = performance.now();
+    if (df.busy || now - df.last < (df.state === "offline" ? 10000 : 1000)) return;
+    const { sx, sy, size } = faceCrop(lm, W, H);
+    dctx.drawImage(video, sx, sy, size, size, 0, 0, 224, 224);
+    df.busy = true; df.last = now;
+    deepAnalyze(dfCv.toDataURL("image/jpeg", 0.9))
+      .then(r => { df.face = r; df.state = "online"; },
+        e => { df.face = null; df.state = e instanceof TypeError ? "offline" : "online"; }) // TypeError: server not reachable
+      .finally(() => { df.busy = false; });
+  }
+  const dfText = r => `${r.age} y · ${r.gender} · ${r.emotion}`;
+
   // Face catalog. shortcut: kept in memory only, lost on reload; move to IndexedDB if captures must persist.
   const captures = [], MAX_CAPTURES = 200, THUMB = 128;
   const thumbCv = Object.assign(document.createElement("canvas"), { width: THUMB, height: THUMB }), tctx = thumbCv.getContext("2d");
@@ -271,7 +295,9 @@ try {
       const { sx, sy, size } = faceCrop(lm, W, H);
       view(tctx, THUMB); tctx.drawImage(video, sx, sy, size, size, 0, 0, THUMB, THUMB);
       const shapes = Object.fromEntries((lastFaces.faceBlendshapes[i]?.categories ?? []).map(c => [c.categoryName, c.score]));
-      captures.push({ t, id: headId(lm), img: thumbCv.toDataURL("image/jpeg", 0.85), expression: classifyExpression(shapes).label });
+      const c = { t, id: headId(lm), img: thumbCv.toDataURL("image/jpeg", 0.85), expression: classifyExpression(shapes).label };
+      captures.push(c);
+      if (df.state === "online") deepAnalyze(c.img).then(r => { c.df = r; renderCatalog(); }, () => {}); // a failed analysis just leaves the line out
     });
     captures.splice(0, Math.max(0, captures.length - MAX_CAPTURES)); // oldest go first
     const btn = $("snap");
@@ -286,7 +312,7 @@ try {
     $("catalog").innerHTML = groups.map(({ id, items }) => `<div class="card" style="border-color:${PEOPLE_COLOR}">
       <div class="row"><span>${id === "?" ? "Not linked to a person" : `ID <b style="color:${PEOPLE_COLOR}">${id}</b>`}</span><span class="k">${items.length} capture${items.length > 1 ? "s" : ""}</span></div>
       <div class="thumbs">${items.map(c => `<a class="thumb" href="${c.img}" download="face-id${id}-${new Date(c.t).toISOString().replace(/[:.]/g, "-")}.jpg">
-        <img src="${c.img}" alt="Face of person ${id}, ${c.expression}"><span>${new Date(c.t).toLocaleTimeString()}</span><span style="color:${EXPR_COLORS[c.expression]}">${c.expression}</span></a>`).join("")}</div>
+        <img src="${c.img}" alt="Face of person ${id}, ${c.expression}"><span>${new Date(c.t).toLocaleTimeString()}</span><span style="color:${EXPR_COLORS[c.expression]}">${c.expression}</span>${c.df ? `<span class="k">${dfText(c.df)}</span>` : ""}</a>`).join("")}</div>
     </div>`).join("");
   }
   $("snap").onclick = captureFaces;
@@ -329,8 +355,11 @@ try {
     hudText(fctx, e.label.toUpperCase(), 22, FS - 22, col, "bold 22px Orbitron, sans-serif");
     hudText(fctx, `EYES ${e.eyes.toUpperCase()} · MOUTH ${e.mouth.toUpperCase()}`, 22, 34, "#cffafe");
 
+    deepFaceTick(lm);
     $("faceOut").innerHTML = `
       <div class="row"><span class="k">Person</span><span style="color:${PEOPLE_COLOR}">ID ${headId(lm)}</span></div>
+      ${df.state === "offline" ? `<div class="row k"><span>DeepFace</span><span>Offline (see README)</span></div>`
+        : df.face ? `<div class="row"><span class="k">Age · gender · emotion</span><span>${dfText(df.face)}</span></div>` : ""}
       <div class="row"><span class="k">Expression</span><span class="big" style="color:${col}">${e.label}</span></div>
       <div class="row"><span class="k">Eyes</span><span>${e.eyes}</span></div>
       <div class="row"><span class="k">Mouth</span><span>${e.mouth}</span></div>

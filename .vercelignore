@@ -3,3 +3,5 @@ server.mjs
 start.bat
 classify.test.mjs
 README.md
+deepface_server.py
+requirements.txt
