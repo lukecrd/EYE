@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -93,4 +93,18 @@ assert.equal(boxAt([big, small], 400, 400).id, 1);
 assert.equal(boxAt([big, small], 600, 600), null);
 assert.deepEqual(Object.values(faceCrop([{ x: .4, y: .2 }, { x: .6, y: .5 }], 1000, 500, 1)).map(Math.round), [400, 75, 200, 500, 175]); // sx, sy, size, cx, cy
 assert.deepEqual(groupCaptures([{ id: 1, t: 1 }, { id: 2, t: 2 }, { id: 1, t: 3 }]).map(g => [g.id, g.items.map(c => c.t)]), [[1, [3, 1]], [2, [2]]]);
+// Held objects
+const arm = body({ ...base, lEl: { x: .3, y: .4 }, lWr: { x: .3, y: .5 } }); arm[19] = { x: .3, y: .55 };
+const hc = handCrop(arm, "left", 1000, 1000);
+assert.deepEqual([hc.sx + hc.size / 2, hc.sy + hc.size / 2].map(Math.round), [300, 540]); // centered past the wrist toward the knuckles
+assert.equal(Math.round(hc.size), 300); // 6 hand lengths (50px) beats 1.65 forearms (100px)
+assert.ok(hc.visible);
+let sm = { scores: {} };
+for (let i = 0; i < 6; i++) sm = smoothScores(sm.scores, [{ categoryName: "ballpoint", score: .5 }, { categoryName: i % 2 ? "nail" : "flute", score: .3 }]);
+assert.equal(sm.label, "ballpoint"); assert.ok(sm.score > .4 && sm.score < .5); // steady label wins, flickering ones stay low
+for (let i = 0; i < 20; i++) sm = smoothScores(sm.scores, []);
+assert.equal(sm.label, null); // fades out once nothing is seen
+const cat = (categoryName, index) => ({ categoryName, index, score: .3 });
+assert.deepEqual(heldCandidates([cat("tench", 0), cat("ballpoint", 418), cat("breastplate", 461), cat("orange", 950), cat("alp", 970), cat("toilet tissue", 999)]).map(c => c.categoryName),
+  ["ballpoint", "orange", "toilet tissue"]); // no animals, clothing or scenery
 console.log("all checks passed");

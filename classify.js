@@ -165,6 +165,37 @@ export function faceCrop(lm, W, H, pad = 1.4) {
   return { sx: (x0 + x1) / 2 * W - size / 2, sy: (y0 + y1) / 2 * H - size / 2, size, cx: (x0 + x1) / 2 * W, cy: (y0 + y1) / 2 * H };
 }
 
+// Square crop around one hand from pose landmarks, in video pixels, for classifying what the hand holds.
+// Centered past the wrist toward the index knuckle; sized from the forearm so it scales with distance from the camera.
+const HAND = { left: [L.lEl, L.lWr, 19], right: [L.rEl, L.rWr, 20] };
+export function handCrop(p, side, W, H) {
+  const [e, w, i] = HAND[side].map(k => ({ x: p[k].x * W, y: p[k].y * H }));
+  const fore = Math.hypot(w.x - e.x, w.y - e.y), hand = Math.hypot(i.x - w.x, i.y - w.y);
+  const cx = w.x + (i.x - w.x) * 0.8, cy = w.y + (i.y - w.y) * 0.8, size = Math.max(48, fore * 1.65, hand * 6); // wide enough for a pen sticking out of the fist
+  return { sx: cx - size / 2, sy: cy - size / 2, size, visible: (p[HAND[side][1]].visibility ?? 1) > 0.5 };
+}
+
+// ImageNet results that can be a held or shown object: man-made things and food (indices 398–969, 998–999),
+// minus clothing and body-worn items the classifier reports whenever a hand is in front of the body.
+const WORN = new Set(["abaya", "academic gown", "apron", "bow tie", "brassiere", "breastplate", "bulletproof vest", "cardigan", "chain mail",
+  "cloak", "cowboy hat", "cuirass", "fur coat", "gown", "hoopskirt", "jean", "jersey", "kimono", "lab coat", "maillot", "military uniform",
+  "miniskirt", "mortarboard", "overskirt", "pajama", "poncho", "sarong", "suit", "sweatshirt", "swimming trunks", "trench coat", "vestment",
+  "velvet", "wig", "Windsor tie", "wool", "stole", "bonnet", "sombrero", "shower cap", "Band Aid", "neck brace", "bib", "feather boa",
+  "mask", "ski mask", "seat belt", "pickelhaube"]);
+export const heldCandidates = categories =>
+  categories.filter(c => ((c.index >= 398 && c.index <= 969) || c.index >= 998) && !WORN.has(c.categoryName));
+
+// Running average of classifier scores ({label: score}): a real object keeps scoring the same label,
+// one-frame noise fades out. Returns the new map and its best label.
+export function smoothScores(prev, categories, alpha = 0.35) {
+  const next = {};
+  for (const [k, v] of Object.entries(prev)) if (v * (1 - alpha) > 0.01) next[k] = v * (1 - alpha);
+  for (const { categoryName, score } of categories) next[categoryName] = (next[categoryName] ?? 0) + alpha * score;
+  let label = null, score = 0;
+  for (const [k, v] of Object.entries(next)) if (v > score) { label = k; score = v; }
+  return { scores: next, label, score };
+}
+
 // Face catalog: captures grouped by person id, most recently seen person first, newest capture first.
 export function groupCaptures(captures) {
   const by = new Map();

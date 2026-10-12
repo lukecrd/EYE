@@ -6,6 +6,7 @@ Real-time body, face and object recognition in the browser, with a futuristic HU
 - **Face:** eyes, irises, eyebrows and mouth; expression (smiling, threatening, surprised, sad, neutral), eyes open/closed/winking, mouth open/closed.
 - **People counter:** a box and a stable ID for every person in view, with "in frame" and "total seen" counts. IDs survive brief occlusions, and one-frame false detections aren't counted.
 - **Objects:** 80 everyday object types (cup, phone, laptop, bottle, chair…) with YOLO26 nano, the model used by [SharpAI/DeepCamera](https://github.com/SharpAI/DeepCamera). It runs on the graphics card through WebGPU when the browser supports it, otherwise on the processor.
+- **Objects beyond YOLO's 80:** an ImageNet classifier (1000 categories, e.g. ballpoint pen, fountain pen, screwdriver, remote) looks at each hand and at the centre of the view, shown in green as "Left hand", "Right hand" and "In view". It works best when the object fills a good part of the picture. Results are averaged over time, and clothing and animal categories are ignored. It runs in a separate thread so it never slows the video.
 - **Video files:** analyze a video from your device instead of the webcam (**Video file** button).
 - **Face catalog:** the **Capture faces** button saves a snapshot of every face in view (up to 4), grouped by person ID with time and expression. Click a snapshot to download it. Snapshots stay in the browser's memory and are lost on reload.
 - **Recording:** saves the body and face panels as a `.webm` video.
@@ -42,4 +43,4 @@ node classify.test.mjs
 EYE is released under the [GNU AGPL-3.0](LICENSE), because it includes the YOLO26 model weights.
 
 - `models/yolo26n.onnx`: Ultralytics YOLO26 nano, © Ultralytics, [AGPL-3.0](https://www.ultralytics.com/license). Taken from [SharpAI/DeepCamera](https://github.com/SharpAI/DeepCamera) (MIT).
-- Body, face models: Google MediaPipe, Apache 2.0, loaded from Google's servers.
+- Body, face and image-classifier models: Google MediaPipe, Apache 2.0, loaded from Google's servers.
