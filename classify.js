@@ -26,13 +26,23 @@ export function classifyPose(p) {
   return "Bending";
 }
 
+const median = a => { const s = [...a].sort((p, q) => p - q); return s[s.length >> 1]; };
+const seen = (p, ...ids) => ids.every(i => (p[i].visibility ?? 1) > 0.5);
+// Jump: for the last `frames` frames, feet visible and both feet and hips clearly above their usual level (the median of
+// the window, so one noisy frame can't move the floor), at the same body size (walking away also moves everything up).
+// MediaPipe guesses ankles even when the feet are out of frame, so without the visibility check any wiggle at a desk was a jump.
+function isJumping(hist, { rise = 0.25, frames = 3 } = {}) {
+  if (hist.length < frames + 3) return false;
+  const feet = p => Math.max(p[L.lAn].y, p[L.rAn].y), hips = p => center(p).y;
+  const floor = median(hist.map(h => feet(h.lm))), hip = median(hist.map(h => hips(h.lm))), size = median(hist.map(h => torso(h.lm)));
+  return hist.slice(-frames).every(({ lm }) => seen(lm, L.lAn, L.rAn, L.lHip, L.rHip)
+    && feet(lm) < floor - rise * size && hips(lm) < hip - rise * size && torso(lm) > 0.85 * size);
+}
+
 // Movement over time from a short history [{t, lm}] (~1.5 s): "Jumping", "Walking" or null.
 export function classifyMotion(hist) {
   if (hist.length < 5) return null;
-  const cur = hist.at(-1).lm, t = torso(cur);
-  // Jump: both feet clearly above the lowest ankle level seen recently (the floor).
-  const floor = Math.max(...hist.map(h => (h.lm[L.lAn].y + h.lm[L.rAn].y) / 2));
-  if (Math.max(cur[L.lAn].y, cur[L.rAn].y) < floor - 0.15 * t) return "Jumping";
+  if (isJumping(hist)) return "Jumping";
   // Walk: the left-right ankle offset swings back and forth (x when seen from the side, y when facing the camera).
   for (const axis of ["x", "y"]) {
     const s = hist.map(h => (h.lm[L.lAn][axis] - h.lm[L.rAn][axis]) / torso(h.lm));

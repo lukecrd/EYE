@@ -23,7 +23,15 @@ const hist = frames => frames.map((lm, i) => ({ t: i * 100, lm }));
 const still = Array(10).fill(body(base));
 assert.equal(classifyMotion(hist(still)), null);
 assert.equal(classifyMotion(hist(still.slice(0, 3))), null); // too little history
-assert.equal(classifyMotion(hist([...still.slice(0, 6), body(shift(base, 0, -.1))])), "Jumping");
+const up = body(shift(base, 0, -.1)); // whole body 0.33 torso higher
+assert.equal(classifyMotion(hist([...still.slice(0, 6), up, up, up])), "Jumping");
+assert.equal(classifyMotion(hist([...still.slice(0, 6), up])), null); // one noisy frame is not a jump
+const noFeet = up.map((q, i) => i === L.lAn || i === L.rAn ? { ...q, visibility: .1 } : q);
+assert.equal(classifyMotion(hist([...still.slice(0, 6), noFeet, noFeet, noFeet])), null); // feet out of frame (webcam at a desk)
+const feetOnly = body({ ...base, lAn: { x: .45, y: .8 }, rAn: { x: .55, y: .8 } });
+assert.equal(classifyMotion(hist([...still.slice(0, 6), feetOnly, feetOnly, feetOnly])), null); // feet up but hips still: not a jump
+const away = body(shift(base, 0, -.1)).map(q => ({ x: q.x, y: .1 + (q.y - .1) * .7 })); // smaller and higher: walking away
+assert.equal(classifyMotion(hist([...still.slice(0, 6), away, away, away])), null);
 // Side view walking: ankles swap front/back three times.
 const step = d => body({ ...base, lAn: { x: .5 + d, y: .9 }, rAn: { x: .5 - d, y: .9 } });
 assert.equal(classifyMotion(hist([step(.1), step(.1), step(-.1), step(-.1), step(.1), step(.1), step(-.1)])), "Walking");
