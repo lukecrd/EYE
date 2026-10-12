@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -86,4 +86,11 @@ const [cup, ...rest] = decodeYolo(logits, qboxes, { scale: .5, padX: 0, padY: 14
 assert.equal(rest.length, 0);
 assert.equal(cup.categories[0].categoryName, "cup"); assert.ok(cup.categories[0].score > .9);
 assert.deepEqual(cup.boundingBox, { originX: 480, originY: 200, width: 320, height: 320 });
+// Face catalog helpers
+const big = { id: 1, box: { x: 0, y: 0, w: 500, h: 500 } }, small = { id: 2, box: { x: 100, y: 100, w: 100, h: 200 } };
+assert.equal(boxAt([big, small], 150, 150).id, 2); // inside both: the tighter box
+assert.equal(boxAt([big, small], 400, 400).id, 1);
+assert.equal(boxAt([big, small], 600, 600), null);
+assert.deepEqual(Object.values(faceCrop([{ x: .4, y: .2 }, { x: .6, y: .5 }], 1000, 500, 1)).map(Math.round), [400, 75, 200, 500, 175]); // sx, sy, size, cx, cy
+assert.deepEqual(groupCaptures([{ id: 1, t: 1 }, { id: 2, t: 2 }, { id: 1, t: 3 }]).map(g => [g.id, g.items.map(c => c.t)]), [[1, [3, 1]], [2, [2]]]);
 console.log("all checks passed");

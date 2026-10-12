@@ -7,7 +7,9 @@ Real-time body, face and object recognition in the browser, with a futuristic HU
 - **People counter:** a box and a stable ID for every person in view, with "in frame" and "total seen" counts. IDs survive brief occlusions, and one-frame false detections aren't counted.
 - **Objects:** 80 everyday object types (cup, phone, laptop, bottle, chair…) with YOLO26 nano, the model used by [SharpAI/DeepCamera](https://github.com/SharpAI/DeepCamera). It runs on the graphics card through WebGPU when the browser supports it, otherwise on the processor.
 - **Video files:** analyze a video from your device instead of the webcam (**Video file** button).
+- **Face catalog:** the **Capture faces** button saves a snapshot of every face in view (up to 4), grouped by person ID with time and expression. Click a snapshot to download it. Snapshots stay in the browser's memory and are lost on reload.
 - **Recording:** saves the body and face panels as a `.webm` video.
+- **Body / Face / Objects switches:** pause the analyses you don't need. On slower graphics cards, pausing Body and Face makes object detection about twice as fast.
 
 The people counter is a browser port of the idea behind [scimone/PeopleDetector](https://github.com/scimone/PeopleDetector) (YOLOv5 + motpy in Python), rewritten from scratch.
 

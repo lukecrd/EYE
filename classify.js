@@ -147,6 +147,34 @@ export function makeBoxTracker({ minIou = 0.3, maxStale = 10, minHits = 3 } = {}
   return step;
 }
 
+// The tracked box containing pixel (x, y); the smallest wins when boxes overlap (the nearer, tighter fit).
+export function boxAt(tracks, x, y) {
+  let best = null;
+  for (const t of tracks) {
+    const { x: bx, y: by, w, h } = t.box;
+    if (x >= bx && x <= bx + w && y >= by && y <= by + h && (!best || w * h < best.box.w * best.box.h)) best = t;
+  }
+  return best;
+}
+
+// Square crop around normalized face landmarks, in video pixels, padded so the whole head fits.
+export function faceCrop(lm, W, H, pad = 1.4) {
+  let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+  for (const q of lm) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y); x1 = Math.max(x1, q.x); y1 = Math.max(y1, q.y); }
+  const size = Math.max((x1 - x0) * W, (y1 - y0) * H) * pad;
+  return { sx: (x0 + x1) / 2 * W - size / 2, sy: (y0 + y1) / 2 * H - size / 2, size, cx: (x0 + x1) / 2 * W, cy: (y0 + y1) / 2 * H };
+}
+
+// Face catalog: captures grouped by person id, most recently seen person first, newest capture first.
+export function groupCaptures(captures) {
+  const by = new Map();
+  for (const c of [...captures].sort((a, b) => b.t - a.t)) {
+    if (!by.has(c.id)) by.set(c.id, []);
+    by.get(c.id).push(c);
+  }
+  return [...by].map(([id, items]) => ({ id, items }));
+}
+
 // Mean landmark displacement between two frames (normalized units).
 export function motion(prev, cur) {
   if (!prev) return 0;

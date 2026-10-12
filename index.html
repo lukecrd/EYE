@@ -22,12 +22,20 @@
   button:disabled { opacity: .4; cursor: default; }
   button.on { background: var(--red); color: #fff; }
   .src { color: var(--cyan); border-color: var(--cyan); box-shadow: inset 0 0 8px rgba(34, 211, 238, .3); }
+  .mod[aria-pressed="false"] { color: var(--dim); border-color: var(--dim); box-shadow: none; text-decoration: line-through; }
   label.src { font: inherit; padding: 6px 14px; border: 1px solid; cursor: pointer; text-transform: uppercase; letter-spacing: .15em; }
   label.src input { position: absolute; opacity: 0; width: 1px; }
   label.src:has(input:focus-visible), button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
   main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; padding: 16px; }
   @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
   .col { display: grid; gap: 16px; align-content: start; }
+  .wide { grid-column: 1 / -1; }
+  #snap { width: 100%; margin-top: 12px; }
+  .err-line { color: var(--red); }
+  .thumbs { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+  .thumb { display: grid; gap: 2px; width: 104px; color: var(--text); text-decoration: none; font-size: 12px; }
+  .thumb img { width: 104px; height: 104px; display: block; border: 1px solid var(--line); }
+  .thumb:hover img, .thumb:focus-visible img { border-color: var(--cyan); box-shadow: 0 0 10px rgba(34, 211, 238, .5); }
   .panel { background: var(--panel); border: 1px solid var(--line); padding: 12px; clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px)); }
   canvas { width: 100%; display: block; }
   .readout { margin-top: 12px; display: grid; gap: 8px; }
@@ -45,6 +53,9 @@
   <h1>Eye</h1>
   <span id="status" aria-live="polite">Loading models…</span>
   <span id="clock"></span>
+  <button class="src mod" data-mod="body" aria-pressed="true" title="Pause or resume body tracking">Body</button>
+  <button class="src mod" data-mod="face" aria-pressed="true" title="Pause or resume face analysis">Face</button>
+  <button class="src mod" data-mod="objects" aria-pressed="true" title="Pause or resume object detection">Objects</button>
   <button id="cam" class="src" disabled>Camera</button>
   <label class="src">Video file<input id="file" type="file" accept="video/*" disabled></label>
   <button id="rec" disabled>● Rec</button>
@@ -59,13 +70,18 @@
     <section class="panel">
       <h2>Face // expression analysis</h2>
       <canvas id="face" width="480" height="480"></canvas>
+      <button id="snap" class="src" disabled>◉ Capture faces</button>
       <div id="faceOut" class="readout"></div>
     </section>
     <section class="panel">
       <h2>Objects // detection</h2>
-      <div id="objOut" class="readout"></div>
+      <div id="objOut" class="readout"><div class="k">Starting detector…</div></div>
     </section>
   </div>
+  <section class="panel wide">
+    <h2>Face catalog // <span id="catCount">0 captures</span></h2>
+    <div id="catalog" class="readout"><div class="k">Press “Capture faces” to save every face in view, grouped by person ID. Click a face to download it.</div></div>
+  </section>
 </main>
 <video id="video" autoplay playsinline muted></video>
 <script type="module">
@@ -100,7 +116,7 @@ try {
   const { PoseLandmarker, FaceLandmarker, FilesetResolver, DrawingUtils } = await import(CDN);
   const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = `${ORT}/`;
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo } = await import("./classify.js");
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures } = await import("./classify.js");
   const bctx = bodyCv.getContext("2d"), fctx = faceCv.getContext("2d"), bdraw = new DrawingUtils(bctx), fdraw = new DrawingUtils(fctx);
 
   const vision = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
@@ -114,26 +130,40 @@ try {
   status.textContent = "Loading body model…";
   const pose = await load(PoseLandmarker, "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", { numPoses: PERSON_COLORS.length });
   status.textContent = "Loading face model…";
-  const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 1, outputFaceBlendshapes: true });
+  const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 4, outputFaceBlendshapes: true });
   status.textContent = "Loading object model…";
-  // YOLO26 nano (Ultralytics, AGPL-3.0; same model as SharpAI/DeepCamera): people and objects. WebGPU if available, else CPU.
-  const yolo = await ort.InferenceSession.create("models/yolo26n.onnx", { executionProviders: ["webgpu", "wasm"] });
+  // YOLO26 nano (Ultralytics, AGPL-3.0; same model as SharpAI/DeepCamera): people and objects.
+  // Graphics card (WebGPU) first, then CPU. The warm-up run proves the backend really works on this device
+  // and compiles the GPU programs now, instead of leaving the panel blank for seconds after start.
+  const yoloInput = data => new ort.Tensor("float32", data, [1, 3, YOLO_SIZE, YOLO_SIZE]);
+  async function startDetector(backends) {
+    for (const ep of backends) {
+      try {
+        const session = await ort.InferenceSession.create("models/yolo26n.onnx", { executionProviders: [ep] });
+        await session.run({ pixel_values: yoloInput(new Float32Array(3 * YOLO_SIZE * YOLO_SIZE)) });
+        return { session, ep, name: ep === "webgpu" ? "Graphics card" : "CPU" };
+      } catch (e) { console.warn(`object detector: ${ep} unavailable`, e); }
+    }
+    throw new Error("the object detector can't start on this device");
+  }
+  let detector = await startDetector(navigator.gpu ? ["webgpu", "wasm"] : ["wasm"]), detectMs = 0, detectError = "";
   const yoloCv = Object.assign(document.createElement("canvas"), { width: YOLO_SIZE, height: YOLO_SIZE });
   const yctx = yoloCv.getContext("2d", { willReadFrequently: true });
 
   // Letterboxes the current frame to 640×640 (grey bars, aspect kept, as the model was trained) and runs it.
   async function detectObjects() {
-    const scale = Math.min(YOLO_SIZE / W, YOLO_SIZE / H), padX = (YOLO_SIZE - W * scale) / 2, padY = (YOLO_SIZE - H * scale) / 2;
+    const t0 = performance.now(), scale = Math.min(YOLO_SIZE / W, YOLO_SIZE / H), padX = (YOLO_SIZE - W * scale) / 2, padY = (YOLO_SIZE - H * scale) / 2;
     yctx.fillStyle = "#727272"; yctx.fillRect(0, 0, YOLO_SIZE, YOLO_SIZE);
     yctx.drawImage(video, padX, padY, W * scale, H * scale);
     const px = yctx.getImageData(0, 0, YOLO_SIZE, YOLO_SIZE).data, N = YOLO_SIZE * YOLO_SIZE, input = new Float32Array(3 * N);
     for (let i = 0; i < N; i++) { input[i] = px[i * 4] / 255; input[N + i] = px[i * 4 + 1] / 255; input[2 * N + i] = px[i * 4 + 2] / 255; }
-    const r = await yolo.run({ pixel_values: new ort.Tensor("float32", input, [1, 3, YOLO_SIZE, YOLO_SIZE]) });
-    return decodeYolo(r.logits.data, r.pred_boxes.data, { size: YOLO_SIZE, scale, padX, padY });
+    const r = await detector.session.run({ pixel_values: yoloInput(input) });
+    detectMs = detectMs ? 0.8 * detectMs + 0.2 * (performance.now() - t0) : performance.now() - t0;
+    return decodeYolo(r.logits.data, r.pred_boxes.data, { size: YOLO_SIZE, scale, padX, padY, threshold: 0.35 });
   }
 
   const FS = faceCv.width, expr = {}, recCv = document.createElement("canvas"), rctx = recCv.getContext("2d");
-  let W = 0, H = 0, track, people, rec = null, frames = 0, fpsT = performance.now(), source = 0, detecting = false, found = [], crowd = [];
+  let W = 0, H = 0, track, people, rec = null, frames = 0, fpsT = performance.now(), source = 0, tick = 0, faceRes = null, detecting = false, found = [], crowd = [];
   const X = px => mirrored ? W - px : px; // video pixel x → screen x
 
   // Switches the analysed source; trackers restart so ids and counts belong to the new source.
@@ -185,7 +215,7 @@ try {
       const color = PERSON_COLORS[(p.id - 1) % PERSON_COLORS.length];
       // Skeletons take the id of the person box around their hips, so both views agree.
       const hx = (p.lm[23].x + p.lm[24].x) / 2 * W, hy = (p.lm[23].y + p.lm[24].y) / 2 * H;
-      const id = crowd.find(t => hx >= t.box.x && hx <= t.box.x + t.box.w && hy >= t.box.y && hy <= t.box.y + t.box.h)?.id ?? "?";
+      const id = boxAt(crowd, hx, hy)?.id ?? "?";
 
       view(bctx, W);
       bdraw.drawConnectors(p.lm, TORSO, { color: "rgba(207, 250, 254, .55)", lineWidth: 2 });
@@ -208,19 +238,57 @@ try {
     $("bodyOut").innerHTML = cards.join("");
   }
 
+  // Face catalog. shortcut: kept in memory only, lost on reload; move to IndexedDB if captures must persist.
+  const captures = [], MAX_CAPTURES = 200, THUMB = 128;
+  const thumbCv = Object.assign(document.createElement("canvas"), { width: THUMB, height: THUMB }), tctx = thumbCv.getContext("2d");
+  let lastFaces = null;
+
+  function captureFaces() {
+    const faces = lastFaces?.faceLandmarks ?? [], t = Date.now();
+    faces.forEach((lm, i) => {
+      const { sx, sy, size, cx, cy } = faceCrop(lm, W, H);
+      view(tctx, THUMB); tctx.drawImage(video, sx, sy, size, size, 0, 0, THUMB, THUMB);
+      const shapes = Object.fromEntries((lastFaces.faceBlendshapes[i]?.categories ?? []).map(c => [c.categoryName, c.score]));
+      captures.push({ t, id: boxAt(crowd, cx, cy)?.id ?? "?", img: thumbCv.toDataURL("image/jpeg", 0.85), expression: classifyExpression(shapes).label });
+    });
+    captures.splice(0, Math.max(0, captures.length - MAX_CAPTURES)); // oldest go first
+    const btn = $("snap");
+    btn.textContent = faces.length ? `✓ ${faces.length} face${faces.length > 1 ? "s" : ""} saved` : "No faces in view";
+    clearTimeout(btn.reset); btn.reset = setTimeout(() => { btn.textContent = "◉ Capture faces"; }, 1500);
+    if (faces.length) renderCatalog();
+  }
+
+  function renderCatalog() {
+    const groups = groupCaptures(captures), known = groups.filter(g => g.id !== "?").length;
+    $("catCount").textContent = `${captures.length} captures · ${known} ${known === 1 ? "person" : "people"}`;
+    $("catalog").innerHTML = groups.map(({ id, items }) => `<div class="card" style="border-color:${PEOPLE_COLOR}">
+      <div class="row"><span>${id === "?" ? "Not linked to a person" : `ID <b style="color:${PEOPLE_COLOR}">${id}</b>`}</span><span class="k">${items.length} capture${items.length > 1 ? "s" : ""}</span></div>
+      <div class="thumbs">${items.map(c => `<a class="thumb" href="${c.img}" download="face-id${id}-${new Date(c.t).toISOString().replace(/[:.]/g, "-")}.jpg">
+        <img src="${c.img}" alt="Face of person ${id}, ${c.expression}"><span>${new Date(c.t).toLocaleTimeString()}</span><span style="color:${EXPR_COLORS[c.expression]}">${c.expression}</span></a>`).join("")}</div>
+    </div>`).join("");
+  }
+  $("snap").onclick = captureFaces;
+  $("snap").disabled = false;
+
+  // Analyses can be paused from the header, to give the others more of a slow graphics card.
+  const enabled = { body: true, face: true, objects: true };
+  for (const b of document.querySelectorAll(".mod")) b.onclick = () => {
+    enabled[b.dataset.mod] = !enabled[b.dataset.mod];
+    b.setAttribute("aria-pressed", enabled[b.dataset.mod]);
+    if (!enabled.objects) { found = []; crowd = []; $("objOut").innerHTML = `<div class="k">Paused</div>`; }
+  };
+
   function drawFace(res) {
+    lastFaces = res;
     plain(fctx); fctx.fillStyle = "#03080d"; fctx.fillRect(0, 0, FS, FS);
-    const lm = res.faceLandmarks[0];
+    const lm = res?.faceLandmarks[0]; // res is null while face analysis is paused
     if (!lm) {
       hudFrame(fctx, FS, FS, "#6b9aa8");
-      hudText(fctx, "NO FACE LOCK", FS / 2 - 70, FS / 2, "#6b9aa8", "bold 18px Orbitron, sans-serif");
-      $("faceOut").innerHTML = `<div class="k">Face the camera</div>`;
+      hudText(fctx, res ? "NO FACE LOCK" : "PAUSED", FS / 2, FS / 2, "#6b9aa8", "bold 18px Orbitron, sans-serif", "center");
+      $("faceOut").innerHTML = `<div class="k">${res ? "Face the camera" : "Face analysis paused"}</div>`;
       return;
     }
-    // Square crop around the face, padded, so it fills the panel.
-    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
-    for (const q of lm) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y); x1 = Math.max(x1, q.x); y1 = Math.max(y1, q.y); }
-    const size = Math.max((x1 - x0) * W, (y1 - y0) * H) * 1.4, sx = (x0 + x1) / 2 * W - size / 2, sy = (y0 + y1) / 2 * H - size / 2;
+    const { sx, sy, size } = faceCrop(lm, W, H); // square crop so the face fills the panel
     view(fctx, FS); fctx.drawImage(video, sx, sy, size, size, 0, 0, FS, FS);
     plain(fctx); fctx.fillStyle = "rgba(3, 12, 18, .5)"; fctx.fillRect(0, 0, FS, FS);
 
@@ -254,10 +322,12 @@ try {
       recCv.width = W + H; recCv.height = H;
     }
     if (!W || video.readyState < 2) return requestAnimationFrame(loop); // no frame to analyse yet
-    drawBody(now, pose.detectForVideo(video, now));
-    drawFace(face.detectForVideo(video, now));
+    drawBody(now, enabled.body ? pose.detectForVideo(video, now) : { landmarks: [] });
+    // The face model runs every other frame (~15/s still looks smooth) so the object detector gets more of the graphics card.
+    if (enabled.face && (tick++ % 2 === 0 || !faceRes)) faceRes = face.detectForVideo(video, now);
+    drawFace(enabled.face ? faceRes : null);
     // Object detection runs alongside the drawing; a new run starts as soon as the previous one finishes.
-    if (!detecting) {
+    if (enabled.objects && !detecting) {
       detecting = true;
       const src = source;
       detectObjects().then(all => {
@@ -265,9 +335,16 @@ try {
         const isPerson = d => d.categories[0].categoryName === "person";
         found = all.filter(d => !isPerson(d));
         crowd = people(all.filter(isPerson).map(({ boundingBox: b, categories: [c] }) => ({ x: b.originX, y: b.originY, w: b.width, h: b.height, score: c.score })));
-        $("objOut").innerHTML = summarizeObjects(found).map(o => `<div class="row"><span style="color:#fbbf24">${o.name}${o.count > 1 ? " ×" + o.count : ""}</span><span>${Math.round(o.best * 100)}%</span></div>`).join("")
-          || `<div class="k">No objects detected</div>`;
-      }).catch(e => console.error("object detection failed", e)).finally(() => { detecting = false; });
+        detectError = "";
+        $("objOut").innerHTML = `<div class="row k"><span>${detector.name}</span><span>${Math.round(detectMs)} ms / scan</span></div>`
+          + (summarizeObjects(found).map(o => `<div class="row"><span style="color:#fbbf24">${o.name}${o.count > 1 ? " ×" + o.count : ""}</span><span>${Math.round(o.best * 100)}%</span></div>`).join("")
+            || `<div class="k">No objects detected</div>`);
+      }).catch(async e => {
+        console.error("object detection failed", e);
+        detectError = detector.ep === "webgpu" ? "Graphics card failed, switched to CPU" : `Detection error: ${e.message}`;
+        $("objOut").innerHTML = `<div class="err-line">${detectError}</div>`;
+        if (detector.ep === "webgpu") detector = await startDetector(["wasm"]).catch(() => detector);
+      }).finally(() => { detecting = false; });
     }
     if (rec) { rctx.drawImage(bodyCv, 0, 0); rctx.drawImage(faceCv, W, 0, H, H); }
     if (++frames, now - fpsT > 1000) {
