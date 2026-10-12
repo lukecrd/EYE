@@ -97,6 +97,34 @@ export function summarizeObjects(detections) {
   return Object.values(by).sort((a, b) => b.count - a.count || b.best - a.best);
 }
 
+// Overlap of two {x, y, w, h} boxes, 0..1.
+export function iou(a, b) {
+  const x = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)), y = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  return x * y / (a.w * a.h + b.w * b.h - x * y || 1);
+}
+
+// People counter: stable ids for person boxes across detection steps (same idea as motpy in scimone/PeopleDetector).
+// A track gets an id only after minHits detections (drops one-off false positives) and keeps it through maxStale missed steps (brief occlusions).
+// shortcut: greedy IoU matching without motion prediction; add a Kalman filter if fast movers lose their id.
+export function makeBoxTracker({ minIou = 0.3, maxStale = 10, minHits = 3 } = {}) {
+  let tracks = [], nextId = 1;
+  const step = boxes => {
+    const free = new Set(tracks);
+    for (const b of [...boxes].sort((p, q) => q.score - p.score)) {
+      let best = null, bv = minIou;
+      for (const t of free) { const v = iou(t.box, b); if (v > bv) { bv = v; best = t; } }
+      if (best) free.delete(best); else tracks.push(best = { hits: 0 });
+      Object.assign(best, { box: b, score: b.score, hits: best.hits + 1, stale: 0 });
+      if (!best.id && best.hits >= minHits) best.id = nextId++;
+    }
+    for (const t of free) t.stale++;
+    tracks = tracks.filter(t => t.stale <= maxStale);
+    return tracks.filter(t => t.id && t.stale === 0); // confirmed people seen in this step
+  };
+  step.total = () => nextId - 1;
+  return step;
+}
+
 // Mean landmark displacement between two frames (normalized units).
 export function motion(prev, cur) {
   if (!prev) return 0;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -67,4 +67,16 @@ assert.equal(wink.eyes, "Winking"); assert.equal(wink.mouth, "Open");
 const det = (name, score) => ({ categories: [{ categoryName: name, score }] });
 assert.deepEqual(summarizeObjects([det("cup", .6), det("laptop", .9), det("cup", .8)]), [{ name: "cup", count: 2, best: .8 }, { name: "laptop", count: 1, best: .9 }]);
 assert.deepEqual(summarizeObjects([]), []);
+// People counter
+assert.equal(iou({ x: 0, y: 0, w: 10, h: 10 }, { x: 0, y: 0, w: 10, h: 10 }), 1);
+assert.equal(iou({ x: 0, y: 0, w: 10, h: 10 }, { x: 20, y: 0, w: 10, h: 10 }), 0);
+const ppl = makeBoxTracker(), A = { x: 0, y: 0, w: 100, h: 200, score: .9 }, B = { x: 300, y: 0, w: 100, h: 200, score: .8 };
+assert.deepEqual(ppl([A, B]), []); assert.deepEqual(ppl([A, B]), []); // not confirmed yet
+assert.deepEqual(ppl([{ ...A, x: 10 }, B]).map(t => t.id), [1, 2]); // A moved a bit, same person
+for (let i = 0; i < 5; i++) ppl([B]); // A hidden for 5 steps
+assert.deepEqual(ppl([A, B]).map(t => t.id).sort(), [1, 2]); // A keeps its id
+assert.deepEqual(ppl([{ x: 600, y: 0, w: 100, h: 200, score: .9 }]), []); // one-off detection isn't counted
+for (let i = 0; i < 11; i++) ppl([]);
+ppl([A]); ppl([A]); assert.deepEqual(ppl([A]).map(t => t.id), [3]); // gone too long: new person
+assert.equal(ppl.total(), 3);
 console.log("all checks passed");
