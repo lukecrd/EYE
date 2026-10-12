@@ -117,7 +117,7 @@ try {
   const { PoseLandmarker, FaceLandmarker, FilesetResolver, DrawingUtils } = await import(CDN);
   const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = `${ORT}/`;
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates } = await import("./classify.js");
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds } = await import("./classify.js");
   const bctx = bodyCv.getContext("2d"), fctx = faceCv.getContext("2d"), bdraw = new DrawingUtils(bctx), fdraw = new DrawingUtils(fctx);
 
   const vision = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
@@ -164,15 +164,28 @@ try {
   }
 
   const FS = faceCv.width, expr = {}, recCv = document.createElement("canvas"), rctx = recCv.getContext("2d");
-  let W = 0, H = 0, track, people, rec = null, frames = 0, fpsT = performance.now(), source = 0, tick = 0, faceRes = null, detecting = false, found = [], crowd = [];
+  let W = 0, H = 0, track, people, heads, rec = null, frames = 0, fpsT = performance.now(), source = 0, tick = 0, faceRes = null, detecting = false, found = [], crowd = [];
   const X = px => mirrored ? W - px : px; // video pixel x → screen x
+  const seen = () => people.total() - heads.merged(); // returning people are not counted twice
+  // Person id of a head: through the body box around it, or from the head alone when no body is detected (e.g. behind a desk).
+  const headId = lm => {
+    const { cx, cy } = faceCrop(lm, W, H), box = boxAt(crowd, cx, cy);
+    return box ? heads.id(box.id) : heads.match(faceSignature(lm, W, H)) ?? "?";
+  };
+  // Every fresh face result teaches the head of the body box it sits in.
+  function observeHeads(res) {
+    for (const lm of res.faceLandmarks) {
+      const { cx, cy } = faceCrop(lm, W, H), box = boxAt(crowd, cx, cy);
+      if (box) heads.observe(box.id, faceSignature(lm, W, H), new Set(crowd.filter(t => t !== box).map(t => heads.id(t.id))));
+    }
+  }
 
   // Switches the analysed source; trackers restart so ids and counts belong to the new source.
   async function useSource(setup, isCamera) {
     video.srcObject?.getTracks().forEach(t => t.stop());
     video.srcObject = null; video.removeAttribute("src");
     await setup();
-    mirrored = isCamera; track = makeTracker(); people = makeBoxTracker(); found = []; crowd = []; source++;
+    mirrored = isCamera; track = makeTracker(); people = makeBoxTracker(); heads = makeHeadIds(); found = []; crowd = []; source++;
     status.textContent = "Starting video…";
     await video.play();
   }
@@ -208,10 +221,10 @@ try {
     for (const t of crowd) {
       const { x: bx, y, w, h } = t.box, x = Math.min(X(bx), X(bx + w));
       hudFrame(bctx, w, h, PEOPLE_COLOR, { x0: x, y0: y, m: 0, s: Math.min(24, w / 3, h / 3) });
-      hudText(bctx, `ID ${t.id} · ${Math.round(t.score * 100)}%`, x + 4, y + h - 8, PEOPLE_COLOR);
+      hudText(bctx, `ID ${heads.id(t.id)} · ${Math.round(t.score * 100)}%`, x + 4, y + h - 8, PEOPLE_COLOR);
     }
-    hudText(bctx, `PEOPLE ${crowd.length} · TOTAL ${people.total()}`, W - 50, 36, PEOPLE_COLOR, "bold 16px Orbitron, sans-serif", "right");
-    const cards = [`<div class="card" style="border-color:${PEOPLE_COLOR}"><div class="row"><span>People in frame <b style="color:${PEOPLE_COLOR}">${crowd.length}</b></span><span class="k">Total seen ${people.total()}</span></div></div>`];
+    hudText(bctx, `PEOPLE ${crowd.length} · TOTAL ${seen()}`, W - 50, 36, PEOPLE_COLOR, "bold 16px Orbitron, sans-serif", "right");
+    const cards = [`<div class="card" style="border-color:${PEOPLE_COLOR}"><div class="row"><span>People in frame <b style="color:${PEOPLE_COLOR}">${crowd.length}</b></span><span class="k">Total seen ${seen()}</span></div></div>`];
     for (const p of track(res.landmarks, now)) {
       p.hist ??= []; p.speed ??= 0;
       p.squats ??= makeRepCounter("Squat", "Standing"); p.jumps ??= makeRepCounter("Jumping");
@@ -224,7 +237,7 @@ try {
       const color = PERSON_COLORS[(p.id - 1) % PERSON_COLORS.length];
       // Skeletons take the id of the person box around their hips, so both views agree.
       const hx = (p.lm[23].x + p.lm[24].x) / 2 * W, hy = (p.lm[23].y + p.lm[24].y) / 2 * H;
-      const id = boxAt(crowd, hx, hy)?.id ?? "?";
+      const box = boxAt(crowd, hx, hy), id = box ? heads.id(box.id) : "?";
 
       view(bctx, W);
       bdraw.drawConnectors(p.lm, TORSO, { color: "rgba(207, 250, 254, .55)", lineWidth: 2 });
@@ -255,10 +268,10 @@ try {
   function captureFaces() {
     const faces = lastFaces?.faceLandmarks ?? [], t = Date.now();
     faces.forEach((lm, i) => {
-      const { sx, sy, size, cx, cy } = faceCrop(lm, W, H);
+      const { sx, sy, size } = faceCrop(lm, W, H);
       view(tctx, THUMB); tctx.drawImage(video, sx, sy, size, size, 0, 0, THUMB, THUMB);
       const shapes = Object.fromEntries((lastFaces.faceBlendshapes[i]?.categories ?? []).map(c => [c.categoryName, c.score]));
-      captures.push({ t, id: boxAt(crowd, cx, cy)?.id ?? "?", img: thumbCv.toDataURL("image/jpeg", 0.85), expression: classifyExpression(shapes).label });
+      captures.push({ t, id: headId(lm), img: thumbCv.toDataURL("image/jpeg", 0.85), expression: classifyExpression(shapes).label });
     });
     captures.splice(0, Math.max(0, captures.length - MAX_CAPTURES)); // oldest go first
     const btn = $("snap");
@@ -317,6 +330,7 @@ try {
     hudText(fctx, `EYES ${e.eyes.toUpperCase()} · MOUTH ${e.mouth.toUpperCase()}`, 22, 34, "#cffafe");
 
     $("faceOut").innerHTML = `
+      <div class="row"><span class="k">Person</span><span style="color:${PEOPLE_COLOR}">ID ${headId(lm)}</span></div>
       <div class="row"><span class="k">Expression</span><span class="big" style="color:${col}">${e.label}</span></div>
       <div class="row"><span class="k">Eyes</span><span>${e.eyes}</span></div>
       <div class="row"><span class="k">Mouth</span><span>${e.mouth}</span></div>
@@ -370,7 +384,7 @@ try {
     if (enabled.objects && heldOk && tick % 4 === 1) classifyNext();
     drawBody(now, bodyRes);
     // The face model runs every other frame (~15/s still looks smooth) so the object detector gets more of the graphics card.
-    if (enabled.face && (tick % 2 === 0 || !faceRes)) faceRes = face.detectForVideo(video, now);
+    if (enabled.face && (tick % 2 === 0 || !faceRes)) observeHeads(faceRes = face.detectForVideo(video, now));
     drawFace(enabled.face ? faceRes : null);
     // Object detection runs alongside the drawing; a new run starts as soon as the previous one finishes.
     if (enabled.objects && !detecting) {

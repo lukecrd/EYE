@@ -157,6 +157,50 @@ export function boxAt(tracks, x, y) {
   return best;
 }
 
+// Head signature: 3D distances between rigid face landmarks (eye corners, nose, cheekbones, brows, forehead) divided by
+// the outer eye span, so it holds at any distance and head turn. Mouth and jaw are left out: they move with expressions.
+const RIGID = [33, 133, 362, 263, 1, 168, 2, 98, 327, 234, 454, 10, 70, 300];
+export function faceSignature(lm, W, H) {
+  const p = RIGID.map(i => [lm[i].x * W, lm[i].y * H, (lm[i].z ?? 0) * W]); // MediaPipe z is on the same scale as x
+  const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]), unit = d(p[0], p[3]) || 1e-6, out = [];
+  for (let i = 0; i < p.length; i++) for (let j = i + 1; j < p.length; j++) out.push(d(p[i], p[j]) / unit);
+  return out;
+}
+// Mean relative difference of two signatures: 0 = same head geometry.
+export const sigDiff = (a, b) => a.reduce((s, v, i) => s + Math.abs(v - b[i]) / ((v + b[i]) / 2 || 1), 0) / a.length;
+
+// Head re-identification: person box track ids → stable person ids. A new box collects `samples` head signatures, then takes
+// the id of the closest known head (someone walking back in) or becomes a new person. Known heads also answer for faces with no box.
+// shortcut: landmark geometry separates a handful of people in one session, not strangers in a crowd; swap in a face-embedding model (e.g. ArcFace ONNX) for that.
+export function makeHeadIds({ maxDiff = 0.06, samples = 8 } = {}) {
+  const heads = new Map(), alias = new Map(), pending = new Map();
+  const best = (sig, skip = new Set()) => {
+    let id = null, bd = maxDiff;
+    for (const [pid, h] of heads) if (!skip.has(pid)) { const v = sigDiff(sig, h.sig); if (v < bd) { bd = v; id = pid; } }
+    return id;
+  };
+  const learn = (pid, sig) => { // running mean, capped so a head keeps adapting to light and pose
+    const h = heads.get(pid) ?? { sig, n: 0 };
+    h.n = Math.min(h.n + 1, 50); h.sig = h.sig.map((v, i) => v + (sig[i] - v) / h.n);
+    heads.set(pid, h);
+  };
+  return {
+    id: boxId => alias.get(boxId) ?? boxId,
+    // busy: person ids on the other boxes in view, since one person can't be in two places.
+    observe(boxId, sig, busy) {
+      if (alias.has(boxId)) return learn(alias.get(boxId), sig);
+      const got = pending.get(boxId) ?? [];
+      pending.set(boxId, got); got.push(sig);
+      if (got.length < samples) return;
+      pending.delete(boxId);
+      const mean = got[0].map((_, i) => got.reduce((s, g) => s + g[i], 0) / got.length), pid = best(mean, busy) ?? boxId;
+      alias.set(boxId, pid); learn(pid, mean);
+    },
+    match: sig => best(sig),
+    merged: () => [...alias].filter(([b, p]) => b !== p).length, // box tracks that turned out to be someone already seen
+  };
+}
+
 // Square crop around normalized face landmarks, in video pixels, padded so the whole head fits.
 export function faceCrop(lm, W, H, pad = 1.4) {
   let x0 = 1, y0 = 1, x1 = 0, y1 = 0;

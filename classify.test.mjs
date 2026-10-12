@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -107,4 +107,17 @@ assert.equal(sm.label, null); // fades out once nothing is seen
 const cat = (categoryName, index) => ({ categoryName, index, score: .3 });
 assert.deepEqual(heldCandidates([cat("tench", 0), cat("ballpoint", 418), cat("breastplate", 461), cat("orange", 950), cat("alp", 970), cat("toilet tissue", 999)]).map(c => c.categoryName),
   ["ballpoint", "orange", "toilet tissue"]); // no animals, clothing or scenery
+// Head re-identification
+const head = (k = 1) => Array.from({ length: 478 }, (_, i) => ({ x: .5 + Math.sin(i) * .05 * (i % 7 === 3 ? k : 1), y: .4 + Math.cos(i * 1.3) * .06, z: Math.sin(i * .7) * .02 }));
+const sa = faceSignature(head(), 1000, 1000), far = faceSignature(head().map(q => ({ x: .5 + (q.x - .5) / 2, y: .4 + (q.y - .4) / 2, z: q.z / 2 })), 1000, 1000);
+assert.ok(sigDiff(sa, far) < 1e-9); // same head at half the size: same signature
+const sb = faceSignature(head(1.6), 1000, 1000);
+assert.ok(sigDiff(sa, sb) > .06); // different proportions: a different head
+const ids = makeHeadIds({ samples: 2 });
+ids.observe(1, sa, new Set()); assert.equal(ids.id(1), 1); ids.observe(1, sa, new Set());
+ids.observe(2, sb, new Set([1])); ids.observe(2, sb, new Set([1])); assert.equal(ids.id(2), 2); // new person
+ids.observe(5, sa, new Set([2])); ids.observe(5, sa, new Set([2])); assert.equal(ids.id(5), 1); // person 1 walks back in as box 5
+assert.equal(ids.merged(), 1);
+ids.observe(6, sa, new Set([1])); ids.observe(6, sa, new Set([1])); assert.equal(ids.id(6), 6); // look-alike while person 1 is in view: not merged
+assert.equal(ids.match(sb), 2); // head alone, no body box
 console.log("all checks passed");
