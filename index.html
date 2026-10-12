@@ -22,6 +22,7 @@
   button:disabled { opacity: .4; cursor: default; }
   button.on { background: var(--red); color: #fff; }
   .src { color: var(--cyan); border-color: var(--cyan); box-shadow: inset 0 0 8px rgba(34, 211, 238, .3); }
+  #debug[aria-pressed="false"] { color: var(--dim); border-color: var(--dim); box-shadow: none; }
   .mod[aria-pressed="false"] { color: var(--dim); border-color: var(--dim); box-shadow: none; text-decoration: line-through; }
   label.src { font: inherit; padding: 6px 14px; border: 1px solid; cursor: pointer; text-transform: uppercase; letter-spacing: .15em; }
   label.src input { position: absolute; opacity: 0; width: 1px; }
@@ -58,6 +59,7 @@
   <button class="src mod" data-mod="objects" aria-pressed="true" title="Pause or resume object detection">Objects</button>
   <button id="cam" class="src" disabled>Camera</button>
   <label class="src">Video file<input id="file" type="file" accept="video/*" disabled></label>
+  <button id="debug" class="src" aria-pressed="false" title="Show the measurements behind jump, walking, fist and head recognition, to calibrate their thresholds">Debug</button>
   <button id="rec" disabled>● Rec</button>
 </header>
 <main>
@@ -82,6 +84,12 @@
   <section class="panel wide">
     <h2>Face catalog // <span id="catCount">0 captures</span></h2>
     <div id="catalog" class="readout"><div class="k">Press “Capture faces” to save every face in view, grouped by person ID. Click a face to download it.</div></div>
+  </section>
+  <section class="panel wide">
+    <h2>Event log // <span id="logCount">0 events</span></h2>
+    <div class="row"><span class="k">People entering and leaving, hand states, postures, jumps, squats and objects. Newest first.</span>
+      <span><button id="logCsv" class="src" disabled>⤓ CSV</button> <button id="logClear" class="src">Clear</button></span></div>
+    <div id="log" class="readout"><div class="k">Nothing yet</div></div>
   </section>
 </main>
 <video id="video" autoplay playsinline muted></video>
@@ -117,7 +125,14 @@ try {
   const { PoseLandmarker, FaceLandmarker, GestureRecognizer, FilesetResolver, DrawingUtils } = await import(CDN);
   const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = `${ORT}/`;
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands } = await import("./classify.js");
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, WALK, GRIP, HEAD_MAX_DIFF } = await import("./classify.js");
+  // Debug button: shows each measurement next to the threshold it's compared with (thresholds live in classify.js).
+  let debug = false;
+  $("debug").onclick = e => { debug = !debug; e.currentTarget.setAttribute("aria-pressed", debug); };
+  const f2 = v => v.toFixed(2), cm = v => (v * 100).toFixed(1);
+  const motionDebug = m => m ? `<div class="row k"><span>Jump rise feet ${f2(m.jump.feet)} · hips ${f2(m.jump.hips)} / ${JUMP.rise}${m.jump.seen ? "" : " (feet hidden)"}</span>
+    <span>Walk legs ${Math.round(m.walk.legs * 100)}% / ${WALK.legs * 100}% · travel ${f2(m.walk.travel)} / ${WALK.travel} · size ×${f2(m.walk.grow)} / ${WALK.grow}</span></div>` : "";
+  const handDebug = s => `gap ${cm(s.gap)} / ${cm(GRIP.fistGap)} cm · ${s.curled} curled · pinch ${cm(s.pinch)} cm`;
   const bctx = bodyCv.getContext("2d"), fctx = faceCv.getContext("2d"), bdraw = new DrawingUtils(bctx), fdraw = new DrawingUtils(fctx);
 
   const vision = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
@@ -174,6 +189,12 @@ try {
   const headId = lm => {
     const { cx, cy } = faceCrop(lm, W, H), box = boxAt(crowd, cx, cy);
     return box ? heads.id(box.id) : heads.match(faceSignature(lm, W, H)) ?? "?";
+  };
+  // Debug: distance from this head to the closest known one, and how many readings the age/gender/emotion average holds.
+  const headDebug = lm => {
+    const near = heads.nearest(faceSignature(lm, W, H));
+    return `<div class="row k"><span>Head diff ${near ? `${near.diff.toFixed(3)} to ID ${near.id}` : "-- (no one known yet)"}</span>
+      <span>same person below ${HEAD_MAX_DIFF}${traits.face?.n ? ` · traits avg of ${traits.face.n}` : ""}</span></div>`;
   };
   // Every fresh face result teaches the head of the body box it sits in.
   function observeHeads(res) {
@@ -232,12 +253,16 @@ try {
     const handStates = hands.map((lm, i) => {
       const o = owners[i], h = o?.pose === 0 && enabled.objects ? held[o.side] : null, obj = h?.label && h.score >= HELD_MIN ? h.label : null;
       const state = handPose(handRes.worldLandmarks[i], { gesture: handRes.gestures[i]?.[0]?.categoryName, holding: !!obj });
-      return { lm, o, text: state === "Holding" && obj ? `Holding ${pretty(obj)}` : state };
+      return { lm, o, text: state === "Holding" && obj ? `Holding ${pretty(obj)}` : state, stats: handStats(handRes.worldLandmarks[i]) };
     });
     for (const h of handStates) {
       view(bctx, W); bdraw.drawConnectors(h.lm, GestureRecognizer.HAND_CONNECTIONS, { color: HAND_COLOR, lineWidth: 2 });
       hudText(bctx, h.text.toUpperCase(), X(h.lm[0].x * W), h.lm[0].y * H + 24, HAND_COLOR, "bold 14px Orbitron, sans-serif", "center");
+      if (debug) hudText(bctx, handDebug(h.stats), X(h.lm[0].x * W), h.lm[0].y * H + 42, HAND_COLOR, "12px 'Share Tech Mono', monospace", "center");
     }
+    const states = {}; // this frame's states for the event log
+    for (const t of crowd) states[`person:${heads.id(t.id)}`] = "in";
+    for (const o of summarizeObjects(found)) states[`object:${o.name}`] = "in";
     const cards = [`<div class="card" style="border-color:${PEOPLE_COLOR}"><div class="row"><span>People in frame <b style="color:${PEOPLE_COLOR}">${crowd.length}</b></span><span class="k">Total seen ${seen()}</span></div></div>`];
     for (const [k, p] of track(res.landmarks, now).entries()) { // same order as res.landmarks
       p.hist ??= []; p.speed ??= 0;
@@ -252,6 +277,10 @@ try {
       // Skeletons take the id of the person box around their hips, so both views agree.
       const hx = (p.lm[23].x + p.lm[24].x) / 2 * W, hy = (p.lm[23].y + p.lm[24].y) / 2 * H;
       const box = boxAt(crowd, hx, hy), id = box ? heads.id(box.id) : "?";
+      if (box) {
+        Object.assign(states, { [`move:${id}`]: label, [`jumps:${id}`]: jumps, [`squats:${id}`]: squats });
+        for (const h of handStates) if (h.o?.pose === k) states[`hand:${id}:${h.o.side}`] = h.text;
+      }
 
       view(bctx, W);
       bdraw.drawConnectors(p.lm, TORSO, { color: "rgba(207, 250, 254, .55)", lineWidth: 2 });
@@ -268,9 +297,11 @@ try {
       cards.push(`<div class="card" style="border-color:${color}">
         <div class="row"><span>#${id} <b style="color:${color}">${label}</b></span><span class="k">${p.speed > 0.01 ? "Moving" : "Still"} · Squats ${squats} · Jumps ${jumps}</span></div>
         ${limbs.map((l, i) => `<div class="row"><span style="color:${LIMB_COLORS[i]}">${l.name}</span><span>${l.visible ? l.deg + "°" : "--"} ${l.state}</span></div>`).join("")}
-        ${handStates.filter(h => h.o?.pose === k).map(h => `<div class="row"><span style="color:${HAND_COLOR}">${h.o.side === "left" ? "Left" : "Right"} hand</span><span>${h.text}</span></div>`).join("")}
+        ${handStates.filter(h => h.o?.pose === k).map(h => `<div class="row"><span style="color:${HAND_COLOR}">${h.o.side === "left" ? "Left" : "Right"} hand</span><span>${h.text}${debug ? ` <span class="k">${handDebug(h.stats)}</span>` : ""}</span></div>`).join("")}
+        ${debug ? motionDebug(motionStats(p.hist)) : ""}
       </div>`);
     }
+    if (enabled.objects) logStates(states); // without person boxes (objects paused) everyone would look like they left
     hudFrame(bctx, W, H, "#22d3ee");
     $("bodyOut").innerHTML = cards.join("");
   }
@@ -296,15 +327,17 @@ try {
     try {
       const [ag, ex] = await Promise.all([faceapi.nets.ageGenderNet.predictAgeAndGender(t), faceapi.nets.faceExpressionNet.predictExpressions(t)]);
       const [emotion] = Object.entries(ex).filter(([, v]) => typeof v === "number").sort((p, q) => q[1] - p[1])[0];
-      return { age: Math.round(ag.age), gender: ag.gender, genderScore: ag.genderProbability, emotion };
+      return { age: Math.round(ag.age), gender: ag.gender, genderScore: ag.genderProbability, emotion, scores: Object.fromEntries(Object.entries(ex).filter(([, v]) => typeof v === "number")) };
     } finally { t.dispose(); }
   }
   function traitsTick(lm) {
     const now = performance.now();
     if (traits.state !== "ready" || traits.busy || now - traits.last < 1000) return;
     traits.busy = true; traits.last = now;
-    analyzeFace(lm).then(r => { traits.face = r; }, e => console.error(e)).finally(() => { traits.busy = false; });
+    const id = headId(lm); // known people get their running average; a face not yet linked to an ID shows the single reading
+    analyzeFace(lm).then(r => { traits.face = id === "?" ? r : averageTraits(`${source}:${id}`, r); }, e => console.error(e)).finally(() => { traits.busy = false; });
   }
+  const averageTraits = makeTraitAverager(); // keyed by source too, since ids restart with a new source
   const traitText = r => `~${r.age} y · ${r.gender} ${Math.round(r.genderScore * 100)}% · ${r.emotion}`;
 
   // Face catalog. shortcut: kept in memory only, lost on reload; move to IndexedDB if captures must persist.
@@ -340,6 +373,44 @@ try {
   }
   $("snap").onclick = captureFaces;
   $("snap").disabled = false;
+
+  // Event log. shortcut: in memory only (last 1000 events), lost on reload; move to IndexedDB if it must persist.
+  const events = [], MAX_EVENTS = 1000;
+  let stateLog = null, logSource = -1;
+  const describe = ({ key, from, to }) => {
+    const [kind, who, side] = key.split(":");
+    if (kind === "object") return { person: "", text: to ? `${who} in view` : `${who} gone` };
+    if (kind === "person") return { person: who, text: to ? "Entered" : "Left" };
+    if (to === null || to === 0) return null; // a hand or posture no longer seen is covered by "Left"; counts start at 0
+    if (kind === "hand") return { person: who, text: `${side === "left" ? "Left" : "Right"} hand: ${to}` };
+    if (kind === "jumps" || kind === "squats") return { person: who, text: `${kind === "jumps" ? "Jump" : "Squat"} #${to}` };
+    return { person: who, text: to }; // posture or movement
+  };
+  const addEvent = (person, text) => {
+    events.push({ t: Date.now(), at: mirrored ? null : video.currentTime, person, text }); // at: position in a video file
+    events.splice(0, Math.max(0, events.length - MAX_EVENTS));
+  };
+  function logStates(states) {
+    if (logSource !== source) { stateLog = makeStateLog(); logSource = source; addEvent("", mirrored ? "Source: camera" : "Source: video file"); renderLog(); }
+    const added = stateLog(states, performance.now()).map(describe).filter(Boolean);
+    for (const e of added) addEvent(e.person, e.text);
+    if (added.length) renderLog();
+  }
+  function renderLog() {
+    $("logCount").textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
+    $("logCsv").disabled = !events.length;
+    $("log").innerHTML = events.slice(-60).reverse().map(e => `<div class="row"><span><span class="k">${new Date(e.t).toLocaleTimeString()}${e.at != null ? ` · ${e.at.toFixed(1)} s` : ""}</span> ${e.person ? `<b style="color:${PEOPLE_COLOR}">ID ${e.person}</b> ` : ""}${e.text}</span></div>`).join("")
+      || `<div class="k">Nothing yet</div>`;
+  }
+  $("logClear").onclick = () => { events.length = 0; renderLog(); };
+  $("logCsv").onclick = () => {
+    const a = document.createElement("a");
+    const csv = toCsv([["time", "video_seconds", "person_id", "event"], ...events.map(e => [new Date(e.t).toISOString(), e.at?.toFixed(1), e.person, e.text])]);
+    a.href = URL.createObjectURL(new Blob([String.fromCharCode(0xfeff) + csv], { type: "text/csv" })); // BOM so Excel reads the accents and symbols right
+    a.download = `eye-events-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  };
 
   // Analyses can be paused from the header, to give the others more of a slow graphics card.
   const enabled = { body: true, face: true, objects: true };
@@ -382,6 +453,7 @@ try {
     $("faceOut").innerHTML = `
       <div class="row"><span class="k">Person</span><span style="color:${PEOPLE_COLOR}">ID ${headId(lm)}</span></div>
       <div class="row"><span class="k">Age · gender · emotion</span><span>${traits.face ? traitText(traits.face) : { loading: "Loading models…", error: "Models failed to load", ready: "Analyzing…" }[traits.state]}</span></div>
+      ${debug ? headDebug(lm) : ""}
       <div class="row"><span class="k">Expression</span><span class="big" style="color:${col}">${e.label}</span></div>
       <div class="row"><span class="k">Eyes</span><span>${e.eyes}</span></div>
       <div class="row"><span class="k">Mouth</span><span>${e.mouth}</span></div>

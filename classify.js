@@ -31,12 +31,29 @@ const seen = (p, ...ids) => ids.every(i => (p[i].visibility ?? 1) > 0.5);
 // Jump: for the last `frames` frames, feet visible and both feet and hips clearly above their usual level (the median of
 // the window, so one noisy frame can't move the floor), at the same body size (walking away also moves everything up).
 // MediaPipe guesses ankles even when the feet are out of frame, so without the visibility check any wiggle at a desk was a jump.
-function isJumping(hist, { rise = 0.25, frames = 3 } = {}) {
-  if (hist.length < frames + 3) return false;
+// Thresholds, exported so the debug overlay can show each measurement next to the value it's compared with.
+export const JUMP = { rise: 0.25, frames: 3, minScale: 0.85 }; // rise in torso lengths
+export const WALK = { legs: 0.8, travel: 0.3, grow: 1.15 }; // share of frames with legs seen; hip travel in torso lengths; size ratio
+// Per-frame jump measures against the window's usual level: rise of feet and hips in torso lengths, body size ratio, feet/hips seen.
+function jumpStats(hist) {
   const feet = p => Math.max(p[L.lAn].y, p[L.rAn].y), hips = p => center(p).y;
   const floor = median(hist.map(h => feet(h.lm))), hip = median(hist.map(h => hips(h.lm))), size = median(hist.map(h => torso(h.lm)));
-  return hist.slice(-frames).every(({ lm }) => seen(lm, L.lAn, L.rAn, L.lHip, L.rHip)
-    && feet(lm) < floor - rise * size && hips(lm) < hip - rise * size && torso(lm) > 0.85 * size);
+  return lm => ({ feet: (floor - feet(lm)) / size, hips: (hip - hips(lm)) / size, scale: torso(lm) / size, seen: seen(lm, L.lAn, L.rAn, L.lHip, L.rHip) });
+}
+function isJumping(hist) {
+  if (hist.length < JUMP.frames + 3) return false;
+  const at = jumpStats(hist);
+  return hist.slice(-JUMP.frames).every(({ lm }) => { const s = at(lm); return s.seen && s.feet > JUMP.rise && s.hips > JUMP.rise && s.scale > JUMP.minScale; });
+}
+// Walking gate measures: share of frames with knees and ankles seen, sideways hip travel (torso lengths), size change ratio.
+function walkStats(hist) {
+  const hx = hist.map(h => center(h.lm).x), sizes = hist.map(h => torso(h.lm));
+  return { legs: hist.filter(h => seen(h.lm, L.lKn, L.rKn, L.lAn, L.rAn)).length / hist.length,
+    travel: (Math.max(...hx) - Math.min(...hx)) / median(sizes), grow: Math.max(...sizes) / Math.min(...sizes) };
+}
+// What jump and walk detection measure on the latest frame, for the debug overlay; null until there's enough history.
+export function motionStats(hist) {
+  return hist.length < 5 ? null : { jump: jumpStats(hist)(hist.at(-1).lm), walk: walkStats(hist) };
 }
 
 // Movement over time from a short history [{t, lm}] (~1.5 s): "Jumping", "Walking" or null.
@@ -46,9 +63,8 @@ export function classifyMotion(hist) {
   // Walking needs legs in view (MediaPipe guesses hidden ankles, so sitting at a desk looked like walking) and a body that goes somewhere:
   // hips travel sideways or the body grows/shrinks (walking toward/away). Legs swinging under a chair don't move the hips.
   // shortcut: walking on the spot (treadmill) isn't recognized; add a knee-lift check if that's needed.
-  if (hist.filter(h => seen(h.lm, L.lKn, L.rKn, L.lAn, L.rAn)).length < 0.8 * hist.length) return null;
-  const hx = hist.map(h => center(h.lm).x), sizes = hist.map(h => torso(h.lm));
-  if ((Math.max(...hx) - Math.min(...hx)) / median(sizes) < 0.3 && Math.max(...sizes) / Math.min(...sizes) < 1.15) return null;
+  const w = walkStats(hist);
+  if (w.legs < WALK.legs || (w.travel < WALK.travel && w.grow < WALK.grow)) return null;
   // Walk: the left-right ankle offset swings back and forth (x when seen from the side, y when facing the camera).
   for (const axis of ["x", "y"]) {
     const s = hist.map(h => (h.lm[L.lAn][axis] - h.lm[L.rAn][axis]) / torso(h.lm));
@@ -188,7 +204,8 @@ export const sigDiff = (a, b) => a.reduce((s, v, i) => s + Math.abs(v - b[i]) / 
 // Head re-identification: person box track ids → stable person ids. A new box collects `samples` head signatures, then takes
 // the id of the closest known head (someone walking back in) or becomes a new person. Known heads also answer for faces with no box.
 // shortcut: landmark geometry separates a handful of people in one session, not strangers in a crowd; swap in a face-embedding model (e.g. ArcFace ONNX) for that.
-export function makeHeadIds({ maxDiff = 0.06, samples = 8 } = {}) {
+export const HEAD_MAX_DIFF = 0.06; // at or above this signature difference, two heads count as different people
+export function makeHeadIds({ maxDiff = HEAD_MAX_DIFF, samples = 8 } = {}) {
   const heads = new Map(), alias = new Map(), pending = new Map();
   const best = (sig, skip = new Set()) => {
     let id = null, bd = maxDiff;
@@ -213,6 +230,12 @@ export function makeHeadIds({ maxDiff = 0.06, samples = 8 } = {}) {
       alias.set(boxId, pid); learn(pid, mean);
     },
     match: sig => best(sig),
+    // Closest known head however far, for the debug overlay: {id, diff}, or null before anyone is known.
+    nearest(sig) {
+      let id = null, diff = Infinity;
+      for (const [pid, h] of heads) { const v = sigDiff(sig, h.sig); if (v < diff) { diff = v; id = pid; } }
+      return id === null ? null : { id, diff };
+    },
     merged: () => [...alias].filter(([b, p]) => b !== p).length, // box tracks that turned out to be someone already seen
   };
 }
@@ -243,22 +266,26 @@ export function assignHands(hands, poses, maxDist = 0.12) {
 // Hand state from MediaPipe hand world landmarks (21 points in meters, so thresholds hold at any distance from the camera).
 // A curled hand is a fist when the fingertips close onto the palm, and holding something when they stay apart, wrapped
 // around it; `holding` (an object seen in that hand) also tells a pen pinch from an empty "OK" sign.
-// shortcut: FIST_GAP is a hand-tuned average adult hand; calibrate on real hands if fists read as holding or the reverse.
-const FINGERS = [[5, 6, 8], [9, 10, 12], [13, 14, 16], [17, 18, 20]], FIST_GAP = 0.045; // MCP, PIP, tip of index…pinky; m
+// shortcut: GRIP.fistGap is a hand-tuned average adult hand; calibrate on real hands if fists read as holding or the reverse.
+const FINGERS = [[5, 6, 8], [9, 10, 12], [13, 14, 16], [17, 18, 20]]; // MCP, PIP and tip of index…pinky
+export const GRIP = { fistGap: 0.045, curl: 120, pinch: 0.03 }; // m, degrees at the middle joint, m
 const GESTURES = { Open_Palm: "Open hand", Pointing_Up: "Pointing", Thumb_Up: "Thumbs up", Thumb_Down: "Thumbs down", Victory: "Victory", ILoveYou: "I love you" };
 const d3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 const angle3 = (a, b, c) => {
   const u = [a.x - b.x, a.y - b.y, a.z - b.z], v = [c.x - b.x, c.y - b.y, c.z - b.z];
   return Math.acos(Math.max(-1, Math.min(1, (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (Math.hypot(...u) * Math.hypot(...v) || 1e-9)))) * 180 / Math.PI;
 };
-export function handPose(w, { gesture = "None", holding = false } = {}) {
+// What handPose measures (also shown by the debug overlay): curled fingers, mean fingertip-to-palm gap and thumb-index gap in meters.
+export function handStats(w) {
   const palm = [0, 5, 9, 13, 17].reduce((s, i) => ({ x: s.x + w[i].x / 5, y: s.y + w[i].y / 5, z: s.z + w[i].z / 5 }), { x: 0, y: 0, z: 0 });
-  const curled = FINGERS.filter(([m, p, t]) => angle3(w[m], w[p], w[t]) < 120).length;
-  const gap = FINGERS.reduce((s, [, , t]) => s + d3(w[t], palm), 0) / FINGERS.length;
-  const named = GESTURES[gesture];
+  return { curled: FINGERS.filter(([m, p, t]) => angle3(w[m], w[p], w[t]) < GRIP.curl).length,
+    gap: FINGERS.reduce((s, [, , t]) => s + d3(w[t], palm), 0) / FINGERS.length, pinch: d3(w[4], w[8]) };
+}
+export function handPose(w, { gesture = "None", holding = false } = {}) {
+  const { curled, gap, pinch } = handStats(w), named = GESTURES[gesture];
   if (named && !holding) return named; // thumbs up and pointing are curled hands too, so the recognizer's names come first
-  if (curled >= 3) return gap < FIST_GAP && !holding ? "Fist" : "Holding";
-  if (holding && (d3(w[4], w[8]) < 0.03 || curled >= 2)) return "Holding"; // pinch grip (pen) or a loose grip
+  if (curled >= 3) return gap < GRIP.fistGap && !holding ? "Fist" : "Holding";
+  if (holding && (pinch < GRIP.pinch || curled >= 2)) return "Holding"; // pinch grip (pen) or a loose grip
   return named ?? (curled === 0 ? "Open hand" : "Relaxed");
 }
 
@@ -302,6 +329,47 @@ export function groupCaptures(captures) {
   }
   return [...by].map(([id, items]) => ({ id, items }));
 }
+
+// Per-person age, gender and emotion that settle instead of jumping each second. Age and gender are means over the last
+// ~maxN readings (gender as the probability of "male"); emotion follows an exponential average of the expression scores,
+// slower than one reading but still able to change. r: {age, gender, genderScore, scores: {emotion: 0..1}}.
+export function makeTraitAverager({ maxN = 30, alpha = 0.3 } = {}) {
+  const by = new Map();
+  return (id, r) => {
+    const p = by.get(id) ?? { n: 0, age: 0, male: 0, emo: {} };
+    p.n = Math.min(p.n + 1, maxN);
+    p.age += (r.age - p.age) / p.n;
+    p.male += ((r.gender === "male" ? r.genderScore : 1 - r.genderScore) - p.male) / p.n;
+    for (const [k, v] of Object.entries(r.scores)) p.emo[k] = p.emo[k] === undefined ? v : p.emo[k] + alpha * (v - p.emo[k]);
+    by.set(id, p);
+    const [emotion] = Object.entries(p.emo).sort((a, b) => b[1] - a[1])[0] ?? [r.emotion];
+    return { age: Math.round(p.age), gender: p.male >= 0.5 ? "male" : "female", genderScore: Math.max(p.male, 1 - p.male), emotion, n: p.n };
+  };
+}
+
+// Event log: turns noisy per-frame states ({key: value}) into change events [{key, from, to}]. A value must hold for `hold` ms
+// before it's reported (one-frame flickers and the brief id a box has before head re-identification never show up),
+// and a key missing for `gone` ms reports to: null (left the view, disappeared).
+export function makeStateLog({ hold = 1000, gone = 3000 } = {}) {
+  const keys = new Map();
+  return (states, now) => {
+    const events = [];
+    for (const [key, value] of Object.entries(states)) {
+      const k = keys.get(key) ?? { shown: null, cand: null, since: now };
+      if (value !== k.cand) { k.cand = value; k.since = now; }
+      k.seen = now; keys.set(key, k);
+      if (k.cand !== k.shown && now - k.since >= hold) { events.push({ key, from: k.shown, to: k.cand }); k.shown = k.cand; }
+    }
+    for (const [key, k] of keys) if (now - k.seen >= gone) {
+      if (k.shown !== null) events.push({ key, from: k.shown, to: null });
+      keys.delete(key);
+    }
+    return events;
+  };
+}
+
+// Rows of values → CSV text (quotes doubled, every field quoted so commas and line breaks are safe).
+export const toCsv = rows => rows.map(r => r.map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
 
 // Mean landmark displacement between two frames (normalized units).
 export function motion(prev, cur) {

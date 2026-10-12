@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, handPose, assignHands, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -153,4 +153,29 @@ assert.equal(handPose(pinch, { holding: true }), "Holding"); // pen between thum
 assert.equal(handPose(openHand, { holding: true }), "Open hand"); // object in front of an open hand is not held
 const person = body(base);
 assert.deepEqual(assignHands([[{ x: .62, y: .5 }], [{ x: .38, y: .47 }], [{ x: .9, y: .9 }]], [person]), [{ pose: 0, side: "right" }, { pose: 0, side: "left" }, null]);
+// Event log
+const ev = makeStateLog({ hold: 1000, gone: 3000 });
+assert.deepEqual(ev({ "person:1": "in" }, 0), []);
+assert.deepEqual(ev({ "person:1": "in" }, 1000), [{ key: "person:1", from: null, to: "in" }]); // held 1 s: entered
+assert.deepEqual(ev({ "person:1": "in", "hand:1:left": "Fist" }, 1100), []);
+assert.deepEqual(ev({ "person:1": "in", "hand:1:left": "Open hand" }, 1200), []); // flicker: Fist never held, never reported
+assert.deepEqual(ev({ "person:1": "in", "hand:1:left": "Open hand" }, 2200), [{ key: "hand:1:left", from: null, to: "Open hand" }]);
+assert.deepEqual(ev({ "person:1": "in", "person:9": "in" }, 2500), []); // id 9 shows briefly (before re-identification)…
+assert.deepEqual(ev({ "person:1": "in" }, 4000), []); // …and is gone before it's held: never logged
+assert.deepEqual(ev({}, 5300), [{ key: "hand:1:left", from: "Open hand", to: null }]); // hand unseen 3 s
+assert.deepEqual(ev({}, 7000), [{ key: "person:1", from: "in", to: null }]); // left
+assert.equal(toCsv([["time", "event"], ["12:00", `said "hi", left`]]), `"time","event"\r\n"12:00","said ""hi"", left"`); // quotes doubled, commas kept inside the field
+// Per-person traits average out
+const avg = makeTraitAverager();
+const read = (age, gender, genderScore, happy) => ({ age, gender, genderScore, scores: { happy, neutral: 1 - happy } });
+avg(1, read(30, "male", .9, .9));
+let tr = avg(1, read(50, "female", .6, .9)); // one odd reading
+assert.equal(tr.age, 40); assert.equal(tr.gender, "male"); assert.equal(tr.n, 2); // P(male) = (.9 + .4) / 2
+for (let i = 0; i < 10; i++) tr = avg(1, read(34, "male", .9, .1));
+assert.ok(tr.age > 33 && tr.age < 37); assert.equal(tr.emotion, "neutral"); // emotion follows, not stuck on the first one
+assert.equal(avg(2, read(20, "female", .8, .1)).age, 20); // other people are separate
+// Debug measures agree with the decisions
+const ms = motionStats(hist([...still.slice(0, 6), up, up, up]));
+assert.ok(ms.jump.feet > JUMP.rise && ms.jump.hips > JUMP.rise && ms.jump.seen); assert.equal(motionStats(hist(still.slice(0, 3))), null);
+const hs = handStats(fist); assert.equal(hs.curled, 4); assert.ok(hs.gap < .045);
 console.log("all checks passed");
