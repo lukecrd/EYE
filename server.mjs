@@ -3,10 +3,10 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 
-const root = import.meta.dirname, types = { ".html": "text/html", ".js": "text/javascript" };
+const root = import.meta.dirname, types = { ".html": "text/html", ".js": "text/javascript", ".onnx": "application/octet-stream" };
 http.createServer(async (req, res) => {
   const path = normalize(join(root, req.url === "/" ? "index.html" : decodeURIComponent(req.url.split("?")[0])));
-  if (!path.startsWith(root) || !types[extname(path)]) return res.writeHead(404).end(); // serve only our .html/.js
+  if (!path.startsWith(root) || !types[extname(path)]) return res.writeHead(404).end(); // serve only our .html/.js/.onnx
   try { res.writeHead(200, { "Content-Type": types[extname(path)] }).end(await readFile(path)); }
   catch { res.writeHead(404).end(); }
-}).listen(8080, "127.0.0.1", () => console.log("Open http://localhost:8080"));
+}).listen(process.env.PORT || 8080, "127.0.0.1", function () { console.log(`Open http://localhost:${this.address().port}`); });

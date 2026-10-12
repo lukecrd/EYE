@@ -87,6 +87,28 @@ export function classifyExpression(s) {
   };
 }
 
+// The 80 COCO classes, in YOLO26 output order.
+export const COCO = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed","dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"];
+
+// YOLO26 output → detections in video pixels, shaped like MediaPipe's so the drawing code is shared.
+// logits: [300 × 80] raw class scores; boxes: [300 × 4] center x, center y, width, height as fractions of the letterboxed input.
+// The model is NMS-free (one query per object), so no overlap filtering is needed.
+export function decodeYolo(logits, boxes, { size = 640, scale, padX, padY, threshold = 0.45 }) {
+  const out = [], K = COCO.length;
+  for (let q = 0; q < boxes.length / 4; q++) {
+    let bi = 0;
+    for (let k = 1; k < K; k++) if (logits[q * K + k] > logits[q * K + bi]) bi = k;
+    const score = 1 / (1 + Math.exp(-logits[q * K + bi]));
+    if (score < threshold) continue;
+    const [cx, cy, w, h] = [0, 1, 2, 3].map(i => boxes[q * 4 + i] * size);
+    out.push({
+      boundingBox: { originX: (cx - w / 2 - padX) / scale, originY: (cy - h / 2 - padY) / scale, width: w / scale, height: h / scale },
+      categories: [{ categoryName: COCO[bi], score }],
+    });
+  }
+  return out;
+}
+
 // Groups MediaPipe object detections by name: [{name, count, best}] most frequent first.
 export function summarizeObjects(detections) {
   const by = {};

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, L } from "./classify.js";
+import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -79,4 +79,11 @@ assert.deepEqual(ppl([{ x: 600, y: 0, w: 100, h: 200, score: .9 }]), []); // one
 for (let i = 0; i < 11; i++) ppl([]);
 ppl([A]); ppl([A]); assert.deepEqual(ppl([A]).map(t => t.id), [3]); // gone too long: new person
 assert.equal(ppl.total(), 3);
+// YOLO decoding: one confident cup in a 1280x720 frame letterboxed to 640 (scale .5, 140px bars top and bottom)
+const logits = new Float32Array(2 * 80).fill(-10), qboxes = new Float32Array([.5, .5, .25, .25, .1, .1, .1, .1]);
+logits[COCO.indexOf("cup")] = 3; // query 0 → cup, sigmoid ≈ .95; query 1 stays below threshold
+const [cup, ...rest] = decodeYolo(logits, qboxes, { scale: .5, padX: 0, padY: 140 });
+assert.equal(rest.length, 0);
+assert.equal(cup.categories[0].categoryName, "cup"); assert.ok(cup.categories[0].score > .9);
+assert.deepEqual(cup.boundingBox, { originX: 480, originY: 200, width: 320, height: 320 });
 console.log("all checks passed");

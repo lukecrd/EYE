@@ -70,6 +70,7 @@
 <video id="video" autoplay playsinline muted></video>
 <script type="module">
 const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14", MODELS = "https://storage.googleapis.com/mediapipe-models";
+const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist", YOLO_SIZE = 640;
 const WINDOW_MS = 1500, PEOPLE_COLOR = "#a78bfa", PERSON_COLORS = ["#22d3ee", "#60a5fa", "#e879f9", "#facc15"], LIMB_COLORS = ["#22d3ee", "#f472b6", "#a3e635", "#fbbf24"];
 const EXPR_COLORS = { Smiling: "#a3e635", Threatening: "#f43f5e", Surprised: "#fbbf24", Sad: "#60a5fa", Neutral: "#22d3ee" };
 const TORSO = [[11, 12], [12, 24], [24, 23], [23, 11]].map(([start, end]) => ({ start, end }));
@@ -96,8 +97,10 @@ try {
   // Browsers block loading classify.js from file://, which used to leave the page silently stuck.
   if (location.protocol === "file:") throw new Error("don't open index.html directly. Double-click start.bat (or run: node server.mjs) and use http://localhost:8080");
   // Dynamic imports so a failed download shows an error instead of hanging.
-  const { PoseLandmarker, FaceLandmarker, ObjectDetector, FilesetResolver, DrawingUtils } = await import(CDN);
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker } = await import("./classify.js");
+  const { PoseLandmarker, FaceLandmarker, FilesetResolver, DrawingUtils } = await import(CDN);
+  const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
+  ort.env.wasm.wasmPaths = `${ORT}/`;
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo } = await import("./classify.js");
   const bctx = bodyCv.getContext("2d"), fctx = faceCv.getContext("2d"), bdraw = new DrawingUtils(bctx), fdraw = new DrawingUtils(fctx);
 
   const vision = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
@@ -113,11 +116,24 @@ try {
   status.textContent = "Loading face model…";
   const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 1, outputFaceBlendshapes: true });
   status.textContent = "Loading object model…";
-  // maxResults is high so crowds get counted; people are split from the other objects below.
-  const objects = await load(ObjectDetector, "object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", { scoreThreshold: 0.5, maxResults: 30 });
+  // YOLO26 nano (Ultralytics, AGPL-3.0; same model as SharpAI/DeepCamera): people and objects. WebGPU if available, else CPU.
+  const yolo = await ort.InferenceSession.create("models/yolo26n.onnx", { executionProviders: ["webgpu", "wasm"] });
+  const yoloCv = Object.assign(document.createElement("canvas"), { width: YOLO_SIZE, height: YOLO_SIZE });
+  const yctx = yoloCv.getContext("2d", { willReadFrequently: true });
+
+  // Letterboxes the current frame to 640×640 (grey bars, aspect kept, as the model was trained) and runs it.
+  async function detectObjects() {
+    const scale = Math.min(YOLO_SIZE / W, YOLO_SIZE / H), padX = (YOLO_SIZE - W * scale) / 2, padY = (YOLO_SIZE - H * scale) / 2;
+    yctx.fillStyle = "#727272"; yctx.fillRect(0, 0, YOLO_SIZE, YOLO_SIZE);
+    yctx.drawImage(video, padX, padY, W * scale, H * scale);
+    const px = yctx.getImageData(0, 0, YOLO_SIZE, YOLO_SIZE).data, N = YOLO_SIZE * YOLO_SIZE, input = new Float32Array(3 * N);
+    for (let i = 0; i < N; i++) { input[i] = px[i * 4] / 255; input[N + i] = px[i * 4 + 1] / 255; input[2 * N + i] = px[i * 4 + 2] / 255; }
+    const r = await yolo.run({ pixel_values: new ort.Tensor("float32", input, [1, 3, YOLO_SIZE, YOLO_SIZE]) });
+    return decodeYolo(r.logits.data, r.pred_boxes.data, { size: YOLO_SIZE, scale, padX, padY });
+  }
 
   const FS = faceCv.width, expr = {}, recCv = document.createElement("canvas"), rctx = recCv.getContext("2d");
-  let W = 0, H = 0, track, people, rec = null, frames = 0, fpsT = performance.now(), tick = 0, found = [], crowd = [];
+  let W = 0, H = 0, track, people, rec = null, frames = 0, fpsT = performance.now(), source = 0, detecting = false, found = [], crowd = [];
   const X = px => mirrored ? W - px : px; // video pixel x → screen x
 
   // Switches the analysed source; trackers restart so ids and counts belong to the new source.
@@ -125,7 +141,7 @@ try {
     video.srcObject?.getTracks().forEach(t => t.stop());
     video.srcObject = null; video.removeAttribute("src");
     await setup();
-    mirrored = isCamera; track = makeTracker(); people = makeBoxTracker(); found = []; crowd = [];
+    mirrored = isCamera; track = makeTracker(); people = makeBoxTracker(); found = []; crowd = []; source++;
     status.textContent = "Starting video…";
     await video.play();
   }
@@ -240,13 +256,18 @@ try {
     if (!W || video.readyState < 2) return requestAnimationFrame(loop); // no frame to analyse yet
     drawBody(now, pose.detectForVideo(video, now));
     drawFace(face.detectForVideo(video, now));
-    if (tick++ % 3 === 0) { // objects move slowly; every 3rd frame keeps three models smooth
-      const all = objects.detectForVideo(video, now).detections, isPerson = d => d.categories[0].categoryName === "person";
-      found = all.filter(d => !isPerson(d));
-      crowd = people(all.filter(isPerson).map(({ boundingBox: b, categories: [c] }) => ({ x: b.originX, y: b.originY, w: b.width, h: b.height, score: c.score })));
-      const list = summarizeObjects(found);
-      $("objOut").innerHTML = list.map(o => `<div class="row"><span style="color:#fbbf24">${o.name}${o.count > 1 ? " ×" + o.count : ""}</span><span>${Math.round(o.best * 100)}%</span></div>`).join("")
-        || `<div class="k">No objects detected</div>`;
+    // Object detection runs alongside the drawing; a new run starts as soon as the previous one finishes.
+    if (!detecting) {
+      detecting = true;
+      const src = source;
+      detectObjects().then(all => {
+        if (src !== source) return; // the source changed while this frame was being analysed
+        const isPerson = d => d.categories[0].categoryName === "person";
+        found = all.filter(d => !isPerson(d));
+        crowd = people(all.filter(isPerson).map(({ boundingBox: b, categories: [c] }) => ({ x: b.originX, y: b.originY, w: b.width, h: b.height, score: c.score })));
+        $("objOut").innerHTML = summarizeObjects(found).map(o => `<div class="row"><span style="color:#fbbf24">${o.name}${o.count > 1 ? " ×" + o.count : ""}</span><span>${Math.round(o.best * 100)}%</span></div>`).join("")
+          || `<div class="k">No objects detected</div>`;
+      }).catch(e => console.error("object detection failed", e)).finally(() => { detecting = false; });
     }
     if (rec) { rctx.drawImage(bodyCv, 0, 0); rctx.drawImage(faceCv, W, 0, H, H); }
     if (++frames, now - fpsT > 1000) {
