@@ -43,6 +43,12 @@ function isJumping(hist, { rise = 0.25, frames = 3 } = {}) {
 export function classifyMotion(hist) {
   if (hist.length < 5) return null;
   if (isJumping(hist)) return "Jumping";
+  // Walking needs legs in view (MediaPipe guesses hidden ankles, so sitting at a desk looked like walking) and a body that goes somewhere:
+  // hips travel sideways or the body grows/shrinks (walking toward/away). Legs swinging under a chair don't move the hips.
+  // shortcut: walking on the spot (treadmill) isn't recognized; add a knee-lift check if that's needed.
+  if (hist.filter(h => seen(h.lm, L.lKn, L.rKn, L.lAn, L.rAn)).length < 0.8 * hist.length) return null;
+  const hx = hist.map(h => center(h.lm).x), sizes = hist.map(h => torso(h.lm));
+  if ((Math.max(...hx) - Math.min(...hx)) / median(sizes) < 0.3 && Math.max(...sizes) / Math.min(...sizes) < 1.15) return null;
   // Walk: the left-right ankle offset swings back and forth (x when seen from the side, y when facing the camera).
   for (const axis of ["x", "y"]) {
     const s = hist.map(h => (h.lm[L.lAn][axis] - h.lm[L.rAn][axis]) / torso(h.lm));

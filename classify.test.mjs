@@ -32,9 +32,13 @@ const feetOnly = body({ ...base, lAn: { x: .45, y: .8 }, rAn: { x: .55, y: .8 } 
 assert.equal(classifyMotion(hist([...still.slice(0, 6), feetOnly, feetOnly, feetOnly])), null); // feet up but hips still: not a jump
 const away = body(shift(base, 0, -.1)).map(q => ({ x: q.x, y: .1 + (q.y - .1) * .7 })); // smaller and higher: walking away
 assert.equal(classifyMotion(hist([...still.slice(0, 6), away, away, away])), null);
-// Side view walking: ankles swap front/back three times.
-const step = d => body({ ...base, lAn: { x: .5 + d, y: .9 }, rAn: { x: .5 - d, y: .9 } });
-assert.equal(classifyMotion(hist([step(.1), step(.1), step(-.1), step(-.1), step(.1), step(.1), step(-.1)])), "Walking");
+// Side view walking: ankles swap front/back three times while the body moves across the view.
+const step = (d, dx = 0) => body(shift({ ...base, lAn: { x: .5 + d, y: .9 }, rAn: { x: .5 - d, y: .9 } }, dx, 0));
+const swings = [.1, .1, -.1, -.1, .1, .1, -.1];
+assert.equal(classifyMotion(hist(swings.map((d, i) => step(d, i * .02)))), "Walking");
+assert.equal(classifyMotion(hist(swings.map(d => step(d)))), null); // legs swinging, hips in place: seated, not walking
+const legsHidden = f => f.map((q, i) => [L.lKn, L.rKn, L.lAn, L.rAn].includes(i) ? { ...q, visibility: .2 } : q);
+assert.equal(classifyMotion(hist(swings.map((d, i) => legsHidden(step(d, i * .02))))), null); // legs out of frame (desk): guessed ankles don't count
 // Small jitter is not walking.
 assert.equal(classifyMotion(hist([step(.05), step(.04), step(.05), step(.04), step(.05), step(.04)])), null);
 
