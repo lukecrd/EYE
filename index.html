@@ -267,6 +267,9 @@ try {
   const traits = { state: "loading", busy: false, last: -Infinity, face: null };
   let faceapi = null; // loads in the background so the video starts without waiting
   import(`${FACEAPI}/dist/face-api.esm.js`).then(async api => {
+    // Pick the backend ourselves: left alone, TensorFlow.js picks WASM without its files and every model load fails.
+    if (!await api.tf.setBackend("webgl").catch(() => false)) await api.tf.setBackend("cpu");
+    await api.tf.ready();
     await Promise.all([api.nets.ageGenderNet, api.nets.faceExpressionNet].map(n => n.loadFromUri(`${FACEAPI}/model`)));
     faceapi = api; traits.state = "ready";
   }).catch(e => { console.error("age/gender/emotion models failed", e); traits.state = "error"; }); // the rest of the page still works
@@ -363,8 +366,7 @@ try {
     traitsTick(lm);
     $("faceOut").innerHTML = `
       <div class="row"><span class="k">Person</span><span style="color:${PEOPLE_COLOR}">ID ${headId(lm)}</span></div>
-      ${traits.state === "error" ? `<div class="row k"><span>Age · gender · emotion</span><span>Models failed to load</span></div>`
-        : traits.face ? `<div class="row"><span class="k">Age · gender · emotion</span><span>${traitText(traits.face)}</span></div>` : ""}
+      <div class="row"><span class="k">Age · gender · emotion</span><span>${traits.face ? traitText(traits.face) : { loading: "Loading models…", error: "Models failed to load", ready: "Analyzing…" }[traits.state]}</span></div>
       <div class="row"><span class="k">Expression</span><span class="big" style="color:${col}">${e.label}</span></div>
       <div class="row"><span class="k">Eyes</span><span>${e.eyes}</span></div>
       <div class="row"><span class="k">Mouth</span><span>${e.mouth}</span></div>
