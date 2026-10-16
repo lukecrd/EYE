@@ -97,7 +97,9 @@
 const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14", MODELS = "https://storage.googleapis.com/mediapipe-models";
 const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist", YOLO_SIZE = 640;
 const WINDOW_MS = 1500, HELD_COLOR = "#34d399", HAND_COLOR = "#fb923c", HELD_MIN = 0.15, PEOPLE_COLOR = "#a78bfa", PERSON_COLORS = ["#22d3ee", "#60a5fa", "#e879f9", "#facc15"], LIMB_COLORS = ["#22d3ee", "#f472b6", "#a3e635", "#fbbf24"];
-const EXPR_COLORS = { Smiling: "#a3e635", Threatening: "#f43f5e", Surprised: "#fbbf24", Sad: "#60a5fa", Neutral: "#22d3ee" };
+// Bodies, faces and hands tracked at once (colors repeat past 4). Each extra person costs frame rate; lower it on slow machines.
+const MAX_PEOPLE = 10;
+const EXPR_COLORS ={ Smiling: "#a3e635", Threatening: "#f43f5e", Surprised: "#fbbf24", Sad: "#60a5fa", Neutral: "#22d3ee" };
 const TORSO = [[11, 12], [12, 24], [24, 23], [23, 11]].map(([start, end]) => ({ start, end }));
 const $ = id => document.getElementById(id);
 const video = $("video"), bodyCv = $("body"), faceCv = $("face"), status = $("status"), recBtn = $("rec");
@@ -125,7 +127,7 @@ try {
   const { PoseLandmarker, FaceLandmarker, GestureRecognizer, FilesetResolver, DrawingUtils } = await import(CDN);
   const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = `${ORT}/`;
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, makeOneEuro, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, WALK, GRIP, HEAD_MAX_DIFF } = await import("./classify.js");
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, makeOneEuro, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, assignToBoxes, ANCHOR, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, WALK, GRIP, HEAD_MAX_DIFF } = await import("./classify.js");
   // Debug button: shows each measurement next to the threshold it's compared with (thresholds live in classify.js).
   let debug = false;
   $("debug").onclick = e => { debug = !debug; e.currentTarget.setAttribute("aria-pressed", debug); };
@@ -145,12 +147,12 @@ try {
   };
   status.textContent = "Loading body model…";
   // "full" is more accurate than "lite"; on slow machines swap back to pose_landmarker_lite (same path pattern).
-  const pose = await load(PoseLandmarker, "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task", { numPoses: PERSON_COLORS.length });
+  const pose = await load(PoseLandmarker, "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task", { numPoses: MAX_PEOPLE });
   status.textContent = "Loading face model…";
-  const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 4, outputFaceBlendshapes: true });
+  const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: MAX_PEOPLE, outputFaceBlendshapes: true });
   status.textContent = "Loading hand model…";
   // 21 points per hand (3D, in meters) plus named gestures; fist vs holding is decided in handPose from the finger geometry.
-  const gestures = await load(GestureRecognizer, "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task", { numHands: 4 });
+  const gestures = await load(GestureRecognizer, "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task", { numHands: MAX_PEOPLE });
   status.textContent = "Loading object model…";
   // YOLO26 nano (Ultralytics, AGPL-3.0; same model as SharpAI/DeepCamera): people and objects.
   // Graphics card (WebGPU) first, then CPU. The warm-up run proves the backend really works on this device
@@ -188,7 +190,7 @@ try {
   const seen = () => people.total() - heads.merged(); // returning people are not counted twice
   // Person id of a head: through the body box around it, or from the head alone when no body is detected (e.g. behind a desk).
   const headId = lm => {
-    const { cx, cy } = faceCrop(lm, W, H), box = boxAt(crowd, cx, cy);
+    const { cx, cy } = faceCrop(lm, W, H), box = boxAt(crowd, cx, cy, ANCHOR.head);
     return box ? heads.id(box.id) : heads.match(faceSignature(lm, W, H)) ?? "?";
   };
   // Debug: distance from this head to the closest known one, and how many readings the age/gender/emotion average holds.
@@ -197,12 +199,13 @@ try {
     return `<div class="row k"><span>Head diff ${near ? `${near.diff.toFixed(3)} to ID ${near.id}` : "-- (no one known yet)"}</span>
       <span>same person below ${HEAD_MAX_DIFF}${traits.face?.n ? ` · traits avg of ${traits.face.n}` : ""}</span></div>`;
   };
-  // Every fresh face result teaches the head of the body box it sits in.
+  // Every fresh face result teaches the head of the body box it sits in (one face per box, so a group can't mix up heads).
   function observeHeads(res) {
-    for (const lm of res.faceLandmarks) {
-      const { cx, cy } = faceCrop(lm, W, H), box = boxAt(crowd, cx, cy);
+    const boxes = assignToBoxes(res.faceLandmarks.map(lm => { const { cx, cy } = faceCrop(lm, W, H); return { x: cx, y: cy }; }), crowd, ANCHOR.head);
+    res.faceLandmarks.forEach((lm, i) => {
+      const box = boxes[i];
       if (box) heads.observe(box.id, faceSignature(lm, W, H), new Set(crowd.filter(t => t !== box).map(t => heads.id(t.id))));
-    }
+    });
   }
 
   // Switches the analysed source; trackers restart so ids and counts belong to the new source.
@@ -265,6 +268,8 @@ try {
     for (const t of crowd) states[`person:${heads.id(t.id)}`] = "in";
     for (const o of summarizeObjects(found)) states[`object:${o.name}`] = "in";
     const cards = [`<div class="card" style="border-color:${PEOPLE_COLOR}"><div class="row"><span>People in frame <b style="color:${PEOPLE_COLOR}">${crowd.length}</b></span><span class="k">Total seen ${seen()}</span></div></div>`];
+    // Skeletons take the id of the person box around their hips (one skeleton per box), so both views agree.
+    const bodyBoxes = assignToBoxes(res.landmarks.map(lm => ({ x: (lm[23].x + lm[24].x) / 2 * W, y: (lm[23].y + lm[24].y) / 2 * H })), crowd, ANCHOR.hips);
     for (const [k, p] of track(res.landmarks, now).entries()) { // same order as res.landmarks
       p.hist ??= []; p.speed ??= 0;
       p.squats ??= makeRepCounter("Squat", "Standing"); p.jumps ??= makeRepCounter("Jumping");
@@ -280,9 +285,7 @@ try {
       const posture = classifyPose(p.lm, world), move = classifyMotion(p.hist), label = move ?? posture;
       const squats = p.squats(posture), jumps = p.jumps(move), limbs = limbStates(p.lm, world);
       const color = PERSON_COLORS[(p.id - 1) % PERSON_COLORS.length];
-      // Skeletons take the id of the person box around their hips, so both views agree.
-      const hx = (p.lm[23].x + p.lm[24].x) / 2 * W, hy = (p.lm[23].y + p.lm[24].y) / 2 * H;
-      const box = boxAt(crowd, hx, hy), id = box ? heads.id(box.id) : "?";
+      const box = bodyBoxes[k], id = box ? heads.id(box.id) : "?";
       if (box) {
         Object.assign(states, { [`move:${id}`]: label, [`jumps:${id}`]: jumps, [`squats:${id}`]: squats });
         for (const h of handStates) if (h.o?.pose === k) states[`hand:${id}:${h.o.side}`] = h.text;

@@ -190,18 +190,25 @@ export function iou(a, b) {
 
 // People counter: stable ids for person boxes across detection steps (same idea as motpy in scimone/PeopleDetector).
 // A track gets an id only after minHits detections (drops one-off false positives) and keeps it through maxStale missed steps (brief occlusions).
-// shortcut: greedy IoU matching without motion prediction; add a Kalman filter if fast movers lose their id.
+// Groups: each track is matched where it's heading (constant velocity), and pairs are taken best overlap first over all
+// tracks and boxes, so two people crossing or standing shoulder to shoulder don't swap ids.
+// shortcut: global greedy, not Hungarian, and no Kalman filter; upgrade if dense crowds still swap ids.
 export function makeBoxTracker({ minIou = 0.3, maxStale = 10, minHits = 3 } = {}) {
   let tracks = [], nextId = 1;
+  const ahead = t => ({ ...t.box, x: t.box.x + t.vx * (t.stale + 1), y: t.box.y + t.vy * (t.stale + 1) });
   const step = boxes => {
-    const free = new Set(tracks);
-    for (const b of [...boxes].sort((p, q) => q.score - p.score)) {
-      let best = null, bv = minIou;
-      for (const t of free) { const v = iou(t.box, b); if (v > bv) { bv = v; best = t; } }
-      if (best) free.delete(best); else tracks.push(best = { hits: 0 });
-      Object.assign(best, { box: b, score: b.score, hits: best.hits + 1, stale: 0 });
-      if (!best.id && best.hits >= minHits) best.id = nextId++;
+    const pairs = [];
+    for (const t of tracks) { const p = ahead(t); boxes.forEach((b, i) => { const v = iou(p, b); if (v > minIou) pairs.push([v, t, i]); }); }
+    const free = new Set(tracks), done = new Set();
+    for (const [, t, i] of pairs.sort((p, q) => q[0] - p[0])) {
+      if (!free.has(t) || done.has(i)) continue;
+      free.delete(t); done.add(i);
+      const b = boxes[i];
+      t.vx = 0.5 * t.vx + 0.5 * (b.x - t.box.x) / (t.stale + 1); t.vy = 0.5 * t.vy + 0.5 * (b.y - t.box.y) / (t.stale + 1);
+      Object.assign(t, { box: b, score: b.score, hits: t.hits + 1, stale: 0 });
     }
+    boxes.forEach((b, i) => { if (!done.has(i)) tracks.push({ box: b, score: b.score, hits: 1, stale: 0, vx: 0, vy: 0 }); });
+    for (const t of tracks) if (!t.id && t.hits >= minHits) t.id = nextId++;
     for (const t of free) t.stale++;
     tracks = tracks.filter(t => t.stale <= maxStale);
     return tracks.filter(t => t.id && t.stale === 0); // confirmed people seen in this step
@@ -210,15 +217,22 @@ export function makeBoxTracker({ minIou = 0.3, maxStale = 10, minHits = 3 } = {}
   return step;
 }
 
-// The tracked box containing pixel (x, y); the smallest wins when boxes overlap (the nearer, tighter fit).
-export function boxAt(tracks, x, y) {
-  let best = null;
-  for (const t of tracks) {
-    const { x: bx, y: by, w, h } = t.box;
-    if (x >= bx && x <= bx + w && y >= by && y <= by + h && (!best || w * h < best.box.w * best.box.h)) best = t;
-  }
-  return best;
+// Where a body part sits in a person box, as a fraction of its height from the top.
+export const ANCHOR = { head: 0.12, hips: 0.55 };
+// One person box per point ({x, y} pixels), or null: among the boxes containing the point, the one whose anchor (e.g. the head
+// spot) is closest, in box sizes. In a group the face of the person in front also lies inside the box of the one behind, and
+// "smallest box" picked the wrong one. Each box goes to at most one point (closest pairs first), since a box is one person.
+export function assignToBoxes(points, tracks, anchor = ANCHOR.hips) {
+  const pairs = [];
+  points.forEach((p, i) => tracks.forEach(t => {
+    const { x, y, w, h } = t.box;
+    if (p.x >= x && p.x <= x + w && p.y >= y && p.y <= y + h) pairs.push([Math.hypot((p.x - x - w / 2) / w, (p.y - y - anchor * h) / h), i, t]);
+  }));
+  const out = points.map(() => null), used = new Set();
+  for (const [, i, t] of pairs.sort((a, b) => a[0] - b[0])) if (!out[i] && !used.has(t)) { out[i] = t; used.add(t); }
+  return out;
 }
+export const boxAt = (tracks, x, y, anchor) => assignToBoxes([{ x, y }], tracks, anchor)[0];
 
 // Head signature: 3D distances between rigid face landmarks (eye corners, nose, cheekbones, brows, forehead) divided by
 // the outer eye span, so it holds at any distance and head turn. Mouth and jaw are left out: they move with expressions.
