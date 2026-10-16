@@ -58,8 +58,8 @@
 </main>
 <video id="video" autoplay playsinline muted></video>
 <script type="module">
-import { decodePlateBoxes, readPlates, makePlateList } from "./plates.js";
-const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist", DET = 384, OCR_W = 128, OCR_H = 64, STORE = "eye-plates";
+import { decodePlateBoxes, readPlates, makePlateList, tiles, mergeBoxes } from "./plates.js";
+const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist", DET = 640, OCR_W = 128, OCR_H = 64, STORE = "eye-plates";
 const $ = id => document.getElementById(id), status = $("status"), video = $("video"), view = $("view"), ctx = view.getContext("2d");
 const fail = msg => { status.textContent = `Error: ${msg}`; status.className = "err"; };
 
@@ -109,21 +109,32 @@ try {
   const ocrCv = Object.assign(document.createElement("canvas"), { width: OCR_W, height: OCR_H }), octx = ocrCv.getContext("2d", { willReadFrequently: true });
   let W = 0, H = 0, busy = false, scanMs = 0, source = 0;
 
-  // One scan: letterbox the frame to 384×384 (grey bars, as the detector was trained), find plates, read them all in one batch.
-  async function scan() {
-    const t0 = performance.now(), scale = Math.min(DET / W, DET / H), padX = (DET - W * scale) / 2, padY = (DET - H * scale) / 2;
+  // One frame frozen per scan: the models take a while, and a moving car would leave the box before its plate is cropped.
+  const frameCv = document.createElement("canvas"), fctx = frameCv.getContext("2d");
+  // Finds plates in one tile of the frozen frame: letterboxed to 640×640 (grey bars, as the detector was trained).
+  async function detect({ sx, sy, sw, sh }) {
+    const scale = Math.min(DET / sw, DET / sh), padX = (DET - sw * scale) / 2, padY = (DET - sh * scale) / 2;
     dctx.fillStyle = "rgb(114,114,114)"; dctx.fillRect(0, 0, DET, DET);
-    dctx.drawImage(video, padX, padY, W * scale, H * scale);
+    dctx.drawImage(frameCv, sx, sy, sw, sh, padX, padY, sw * scale, sh * scale);
     const px = dctx.getImageData(0, 0, DET, DET).data, N = DET * DET, input = new Float32Array(3 * N);
     for (let i = 0; i < N; i++) { input[i] = px[i * 4] / 255; input[N + i] = px[i * 4 + 1] / 255; input[2 * N + i] = px[i * 4 + 2] / 255; }
-    const boxes = decodePlateBoxes((await detector.run(detInput(input))).output0.data, { scale, padX, padY })
+    return decodePlateBoxes((await detector.run(detInput(input))).output0.data, { scale, padX, padY }).map(b => ({ ...b, x: b.x + sx, y: b.y + sy }));
+  }
+  // One scan: find plates in each tile (two overlapping halves, so far plates stay big enough), read them all in one batch.
+  async function scan() {
+    const t0 = performance.now();
+    if (frameCv.width !== W || frameCv.height !== H) { frameCv.width = W; frameCv.height = H; }
+    fctx.drawImage(video, 0, 0, W, H);
+    const all = [];
+    for (const t of tiles(W, H)) all.push(...await detect(t));
+    const boxes = mergeBoxes(all)
       .map(b => { const x = Math.max(0, b.x), y = Math.max(0, b.y); return { ...b, x, y, w: Math.min(W, b.x + b.w) - x, h: Math.min(H, b.y + b.h) - y }; })
       .filter(b => b.w > 4 && b.h > 2);
     let found = [];
     if (boxes.length) {
       const batch = new Uint8Array(boxes.length * OCR_H * OCR_W * 3);
       boxes.forEach((b, n) => { // each plate stretched to 128×64 RGB, as the reader was trained
-        octx.drawImage(video, b.x, b.y, b.w, b.h, 0, 0, OCR_W, OCR_H);
+        octx.drawImage(frameCv, b.x, b.y, b.w, b.h, 0, 0, OCR_W, OCR_H);
         const d = octx.getImageData(0, 0, OCR_W, OCR_H).data;
         for (let i = 0; i < OCR_W * OCR_H; i++) for (let c = 0; c < 3; c++) batch[(n * OCR_W * OCR_H + i) * 3 + c] = d[i * 4 + c];
       });
@@ -144,7 +155,7 @@ try {
   }
   const startCamera = () => useSource(async () => {
     status.textContent = "Waiting for camera… (allow access in the browser bar)";
-    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "environment" } }); // plates need pixels
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1920, height: 1080, facingMode: "environment" } }); // far plates need every pixel; cameras without 1080p give their best
   });
   $("cam").onclick = () => startCamera().catch(e => fail(e.message));
   $("file").onchange = e => { const f = e.target.files[0]; if (f) useSource(async () => { video.src = URL.createObjectURL(f); video.loop = true; }).catch(err => fail(`can't play this video (${err.message})`)); };

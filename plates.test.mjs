@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
-import { decodePlateBoxes, readPlates, makePlateList, OCR } from "./plates.js";
+import { decodePlateBoxes, readPlates, makePlateList, OCR, tiles, mergeBoxes } from "./plates.js";
 
 // Detector rows: a sure plate and a weak one, in a 1280×720 frame letterboxed to 384 (scale .3, 54 px bars top and bottom).
 const boxes = decodePlateBoxes([0, 100, 154, 160, 169, 0, .9, 0, 10, 60, 20, 70, 0, .1], { scale: .3, padX: 0, padY: 54 });
 assert.equal(boxes.length, 1);
 assert.deepEqual(Object.values(boxes[0]).map(v => Math.round(v * 10) / 10), [333.3, 333.3, 200, 50, .9]);
+
+// Tiles: a 1920×1080 frame → two 1152-wide halves overlapping by 384 px; portrait frames stay whole.
+assert.deepEqual(tiles(1920, 1080), [{ sx: 0, sy: 0, sw: 1152, sh: 1080 }, { sx: 768, sy: 0, sw: 1152, sh: 1080 }]);
+assert.deepEqual(tiles(720, 1280), [{ sx: 0, sy: 0, sw: 720, sh: 1280 }]);
+// The same plate found in both halves is kept once (the surer box); a different plate stays.
+const plateA = { x: 800, y: 500, w: 100, h: 25, score: .7 }, plateA2 = { x: 802, y: 501, w: 98, h: 25, score: .9 }, plateB = { x: 100, y: 500, w: 100, h: 25, score: .5 };
+assert.deepEqual(mergeBoxes([plateA, plateB, plateA2]), [plateA2, plateB]);
 
 // OCR: "AB123CD" then padding; the weakest letter sets the confidence.
 const probsFor = (text, weak = {}) => {

@@ -12,6 +12,25 @@ export function decodePlateBoxes(rows, { scale, padX, padY, threshold = 0.4 }) {
   return out;
 }
 
+// Far plates are a few pixels tall once a whole frame is shrunk to the detector's 640×640, so a landscape frame is scanned
+// as two halves that overlap by `overlap` of the width: each half is shrunk less, and any plate narrower than the overlap
+// lies whole in at least one half. Returns source rectangles in video pixels.
+export function tiles(W, H, overlap = 0.2) {
+  if (W <= H) return [{ sx: 0, sy: 0, sw: W, sh: H }];
+  const sw = Math.round(W * (1 + overlap) / 2);
+  return [{ sx: 0, sy: 0, sw, sh: H }, { sx: W - sw, sy: 0, sw, sh: H }];
+}
+
+// A plate in the overlap is found in both halves: keep the surer box of any two that overlap.
+export function mergeBoxes(boxes, minIou = 0.3) {
+  const inter = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const out = [];
+  for (const b of [...boxes].sort((p, q) => q.score - p.score)) {
+    if (out.every(o => { const i = inter(o, b); return i / (o.w * o.h + b.w * b.h - i) <= minIou; })) out.push(b);
+  }
+  return out;
+}
+
 // Plate OCR (fast-plate-ocr cct-xs-v2-global): per plate, `slots` character positions with a probability for each
 // alphabet symbol; "_" pads short plates. conf is the weakest character's probability, so one unsure letter lowers it.
 export const OCR = { slots: 10, alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_", pad: "_" };
