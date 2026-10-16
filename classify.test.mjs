@@ -132,6 +132,13 @@ const cross = makeBoxTracker(), walker = x => ({ x, y: 0, w: 100, h: 200, score:
 let crossed;
 for (let s = 0; s <= 8; s++) crossed = cross([walker(s * 40), walker(400 - s * 40)]);
 assert.deepEqual(crossed.map(t => [t.id, Math.round(t.box.x)]).sort((p, q) => p[0] - q[0]), [[1, 320], [2, 80]]);
+// Door: a walker moves more than their own width between slow scans (boxes never overlap) and is still counted once.
+const door = makeBoxTracker();
+for (let s = 0; s < 6; s++) door([{ x: s * 200, y: 100, w: 120, h: 300, score: .8 }]);
+assert.equal(door.total(), 1);
+const door2 = makeBoxTracker(); // two walkers side by side through the door: two people
+for (let s = 0; s < 6; s++) door2([{ x: s * 200, y: 100, w: 120, h: 300, score: .8 }, { x: s * 200, y: 600, w: 120, h: 300, score: .8 }]);
+assert.equal(door2.total(), 2);
 assert.deepEqual(Object.values(faceCrop([{ x: .4, y: .2 }, { x: .6, y: .5 }], 1000, 500, 1)).map(Math.round), [400, 75, 200, 500, 175]); // sx, sy, size, cx, cy
 assert.deepEqual(groupCaptures([{ id: 1, t: 1 }, { id: 2, t: 2 }, { id: 1, t: 3 }]).map(g => [g.id, g.items.map(c => c.t)]), [[1, [3, 1]], [2, [2]]]);
 // Held objects

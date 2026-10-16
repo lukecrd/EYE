@@ -193,12 +193,27 @@ export function iou(a, b) {
 // Groups: each track is matched where it's heading (constant velocity), and pairs are taken best overlap first over all
 // tracks and boxes, so two people crossing or standing shoulder to shoulder don't swap ids.
 // shortcut: global greedy, not Hungarian, and no Kalman filter; upgrade if dense crowds still swap ids.
-export function makeBoxTracker({ minIou = 0.3, maxStale = 10, minHits = 3 } = {}) {
+// Someone walking through a door can move more than their own width between two scans (slow CPU detection), so the boxes
+// don't overlap at all and every scan looked like a new person that never got confirmed or counted. Leftover boxes are
+// then matched by distance (within maxJump box widths, similar height) to a track seen in the previous scan, ranked below any overlap.
+// shortcut: a person entering right where another left in the previous scan inherits that id; fine for a door, not for a turnstile.
+export function makeBoxTracker({ minIou = 0.3, maxStale = 10, minHits = 3, maxJump = 2 } = {}) {
   let tracks = [], nextId = 1;
   const ahead = t => ({ ...t.box, x: t.box.x + t.vx * (t.stale + 1), y: t.box.y + t.vy * (t.stale + 1) });
+  const near = (a, b) => {
+    const d = Math.hypot(a.x + a.w / 2 - b.x - b.w / 2, a.y + a.h / 2 - b.y - b.h / 2) / Math.max(a.w, b.w), r = b.h / a.h;
+    return d < maxJump && r > 2 / 3 && r < 1.5 ? minIou * (1 - d / maxJump) : 0; // always below minIou: overlaps win
+  };
   const step = boxes => {
     const pairs = [];
-    for (const t of tracks) { const p = ahead(t); boxes.forEach((b, i) => { const v = iou(p, b); if (v > minIou) pairs.push([v, t, i]); }); }
+    for (const t of tracks) {
+      const p = ahead(t);
+      boxes.forEach((b, i) => {
+        const v = Math.max(iou(p, b), iou(t.box, b)); // last box too: someone who stopped while hidden isn't predicted away
+        if (v > minIou) pairs.push([v, t, i]);
+        else if (t.stale === 0) { const n = near(p, b); if (n > 0) pairs.push([n, t, i]); }
+      });
+    }
     const free = new Set(tracks), done = new Set();
     for (const [, t, i] of pairs.sort((p, q) => q[0] - p[0])) {
       if (!free.has(t) || done.has(i)) continue;
