@@ -7,27 +7,58 @@ export function angle(a, b, c) {
   let d = Math.abs((ab - cb) * 180 / Math.PI);
   return d > 180 ? 360 - d : d;
 }
+// Angle at b in 3D (degrees): a limb pointing at the camera keeps its true bend, where the 2D angle collapses.
+const angle3 = (a, b, c) => {
+  const u = [a.x - b.x, a.y - b.y, a.z - b.z], v = [c.x - b.x, c.y - b.y, c.z - b.z];
+  return Math.acos(Math.max(-1, Math.min(1, (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (Math.hypot(...u) * Math.hypot(...v) || 1e-9)))) * 180 / Math.PI;
+};
+// Joint angle at b: from world landmarks w (3D, meters) when given, else from the 2D image landmarks p.
+const bend = (p, w, a, b, c) => w ? angle3(w[a], w[b], w[c]) : angle(p[a], p[b], p[c]);
+
+// One Euro filter over a landmark array (x, y, z of each point; visibility passes through), t in ms.
+// Still points are smoothed hard (no jitter), fast ones barely (no lag): the cutoff rises with speed.
+// shortcut: minCutoff/beta are hand-picked for normalized coords at ~30 fps; tune on the camera if joints lag or still shake.
+export function makeOneEuro({ minCutoff = 1, beta = 5, dCutoff = 1 } = {}) {
+  let prev = null, dx = null, last = 0;
+  const a = (cut, dt) => 1 / (1 + 1 / (2 * Math.PI * cut * dt));
+  return (lm, t) => {
+    const dt = (t - last) / 1000;
+    if (!prev || prev.length !== lm.length) { last = t; dx = lm.map(() => ({ x: 0, y: 0, z: 0 })); return prev = lm.map(q => ({ ...q })); }
+    if (dt <= 0) return prev; // same frame again
+    last = t;
+    return prev = lm.map((q, i) => {
+      const o = { ...q };
+      for (const k of ["x", "y", "z"]) if (k in q) {
+        dx[i][k] += a(dCutoff, dt) * ((q[k] - prev[i][k]) / dt - dx[i][k]);
+        o[k] = prev[i][k] + a(minCutoff + beta * Math.abs(dx[i][k]), dt) * (q[k] - prev[i][k]);
+      }
+      return o;
+    });
+  };
+}
 
 const center = p => ({ x: (p[L.lHip].x + p[L.rHip].x) / 2, y: (p[L.lHip].y + p[L.rHip].y) / 2 });
 // Shoulder-to-hip height: the body's own scale, so thresholds work at any distance from the camera.
 const torso = p => Math.abs(center(p).y - (p[L.lSh].y + p[L.rSh].y) / 2) || 1e-6;
+const seen = (p, ...ids) => ids.every(i => (p[i].visibility ?? 1) > 0.5);
 
-// Returns a posture label for one frame.
-export function classifyPose(p) {
-  const knee = (angle(p[L.lHip], p[L.lKn], p[L.lAn]) + angle(p[L.rHip], p[L.rKn], p[L.rAn])) / 2;
-  const elbow = Math.min(angle(p[L.lSh], p[L.lEl], p[L.lWr]), angle(p[L.rSh], p[L.rEl], p[L.rWr]));
+// Returns a posture label for one frame. p: image landmarks (positions on screen); w: optional world landmarks (joint angles).
+export function classifyPose(p, w) {
+  const knee = (bend(p, w, L.lHip, L.lKn, L.lAn) + bend(p, w, L.rHip, L.rKn, L.rAn)) / 2;
+  const elbow = Math.min(bend(p, w, L.lSh, L.lEl, L.lWr), bend(p, w, L.rSh, L.rEl, L.rWr));
   const t = torso(p);
   const wristsAtShoulder = Math.abs(p[L.lWr].y - p[L.lSh].y) < 0.25 * t && Math.abs(p[L.rWr].y - p[L.rSh].y) < 0.25 * t;
 
   if (p[L.lWr].y < p[L.nose].y && p[L.rWr].y < p[L.nose].y) return "Hands up";
   if (wristsAtShoulder && elbow > 150) return "T-pose";
+  // MediaPipe guesses knees and ankles out of frame (seated at a desk), so leg postures need the legs really seen.
+  if (!seen(p, L.lHip, L.rHip, L.lKn, L.rKn, L.lAn, L.rAn)) return "Upper body";
   if (knee < 110) return "Squat";
   if (knee > 160) return "Standing";
   return "Bending";
 }
 
 const median = a => { const s = [...a].sort((p, q) => p - q); return s[s.length >> 1]; };
-const seen = (p, ...ids) => ids.every(i => (p[i].visibility ?? 1) > 0.5);
 // Jump: for the last `frames` frames, feet visible and both feet and hips clearly above their usual level (the median of
 // the window, so one noisy frame can't move the floor), at the same body size (walking away also moves everything up).
 // MediaPipe guesses ankles even when the feet are out of frame, so without the visibility check any wiggle at a desk was a jump.
@@ -88,11 +119,11 @@ export const LIMBS = [
   { name: "Right leg", ids: [L.rHip, L.rKn, L.rAn] },
 ];
 
-// Per-limb status: visible?, bend angle at elbow/knee, and Raised / Extended / Bent.
-export function limbStates(p) {
+// Per-limb status: visible?, bend angle at elbow/knee (3D from world landmarks w when given), and Raised / Extended / Bent.
+export function limbStates(p, w) {
   return LIMBS.map(({ name, ids: [a, b, c] }) => {
-    const visible = [a, b, c].every(i => (p[i].visibility ?? 1) > 0.5);
-    const deg = Math.round(angle(p[a], p[b], p[c]));
+    const visible = seen(p, a, b, c);
+    const deg = Math.round(bend(p, w, a, b, c));
     const raised = name.endsWith("arm") ? p[c].y < p[a].y : p[b].y < p[a].y; // wrist above shoulder / knee above hip
     const state = !visible ? "Not visible" : raised ? "Raised" : deg > 150 ? "Extended" : "Bent";
     return { name, ids: [a, b, c], visible, deg, state };
@@ -271,10 +302,6 @@ const FINGERS = [[5, 6, 8], [9, 10, 12], [13, 14, 16], [17, 18, 20]]; // MCP, PI
 export const GRIP = { fistGap: 0.045, curl: 120, pinch: 0.03 }; // m, degrees at the middle joint, m
 const GESTURES = { Open_Palm: "Open hand", Pointing_Up: "Pointing", Thumb_Up: "Thumbs up", Thumb_Down: "Thumbs down", Victory: "Victory", ILoveYou: "I love you" };
 const d3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
-const angle3 = (a, b, c) => {
-  const u = [a.x - b.x, a.y - b.y, a.z - b.z], v = [c.x - b.x, c.y - b.y, c.z - b.z];
-  return Math.acos(Math.max(-1, Math.min(1, (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (Math.hypot(...u) * Math.hypot(...v) || 1e-9)))) * 180 / Math.PI;
-};
 // What handPose measures (also shown by the debug overlay): curled fingers, mean fingertip-to-palm gap and thumb-index gap in meters.
 export function handStats(w) {
   const palm = [0, 5, 9, 13, 17].reduce((s, i) => ({ x: s.x + w[i].x / 5, y: s.y + w[i].y / 5, z: s.z + w[i].z / 5 }), { x: 0, y: 0, z: 0 });

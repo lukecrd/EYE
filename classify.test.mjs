@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { angle, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, L } from "./classify.js";
+import { angle, makeOneEuro, classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, iou, makeBoxTracker, decodeYolo, COCO, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, sigDiff, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, L } from "./classify.js";
 
 // Build a 33-point skeleton from a few named joints.
 const body = j => Array.from({ length: 33 }, (_, i) => j[Object.keys(L).find(k => L[k] === i)] ?? { x: 0.5, y: 0.5 });
@@ -15,6 +15,25 @@ assert.equal(classifyPose(body({ ...base, lWr: { x: .4, y: 0 }, rWr: { x: .6, y:
 assert.equal(classifyPose(body({ ...base, lEl: { x: .3, y: .2 }, rEl: { x: .7, y: .2 }, lWr: { x: .2, y: .2 }, rWr: { x: .8, y: .2 } })), "T-pose");
 const squat = body({ ...base, lKn: { x: .3, y: .6 }, rKn: { x: .7, y: .6 }, lAn: { x: .45, y: .7 }, rAn: { x: .55, y: .7 } });
 assert.equal(classifyPose(squat), "Squat");
+const seated = body(base).map((q, i) => [L.lKn, L.rKn, L.lAn, L.rAn].includes(i) ? { ...q, visibility: .1 } : q);
+assert.equal(classifyPose(seated), "Upper body"); // legs out of frame (desk): no guessed Standing/Squat
+assert.equal(classifyPose(seated.map((q, i) => i === L.lWr || i === L.rWr ? { ...q, y: 0 } : q)), "Hands up"); // arm postures still work
+// 3D angles: forearm pointing at the camera. In the image the wrist sits on the elbow (2D angle meaningless), in 3D the arm is straight.
+const w3 = body(base).map(q => ({ ...q, z: 0 }));
+w3[L.lSh] = { x: 0, y: 0, z: .3 }; w3[L.lEl] = { x: 0, y: 0, z: 0 }; w3[L.lWr] = { x: 0, y: 0, z: -.3 }; // straight along z
+const towardCam = body({ ...base, lEl: { x: .41, y: .22 }, lWr: { x: .4, y: .21 } });
+assert.equal(limbStates(towardCam)[0].state, "Bent"); // 2D alone: foreshortened arm reads as folded
+assert.equal(limbStates(towardCam, w3)[0].deg, 180); assert.equal(limbStates(towardCam, w3)[0].state, "Extended");
+w3[L.lWr] = { x: 0, y: .3, z: 0 }; assert.equal(limbStates(towardCam, w3)[0].deg, 90); // bent 90° in depth
+assert.equal(classifyPose(body(base), body(base).map(q => ({ ...q, z: 0 }))), "Standing"); // world landmarks give the same label on a flat pose
+// One Euro filter: settles on a constant input, and damps jitter on a still point.
+const euro = makeOneEuro();
+let out; for (let i = 0; i < 60; i++) out = euro([{ x: i ? .5 : 0, y: .3, z: 0, visibility: .9 }], i * 33);
+assert.ok(Math.abs(out[0].x - .5) < 1e-3 && out[0].visibility === .9);
+const euro2 = makeOneEuro(), raw = [], smooth = [];
+for (let i = 0; i < 90; i++) { const x = .5 + (i % 2 ? .01 : -.01); raw.push(x); smooth.push(euro2([{ x, y: .5 }], i * 33)[0].x); }
+const swing = a => Math.max(...a.slice(30)) - Math.min(...a.slice(30));
+assert.ok(swing(smooth) < swing(raw) / 3, `jitter ${swing(smooth)} vs ${swing(raw)}`);
 assert.equal(motion(null, squat), 0);
 assert.ok(motion(body(base), squat) > 0);
 

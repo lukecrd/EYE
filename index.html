@@ -125,7 +125,7 @@ try {
   const { PoseLandmarker, FaceLandmarker, GestureRecognizer, FilesetResolver, DrawingUtils } = await import(CDN);
   const ort = await import(`${ORT}/ort.webgpu.min.mjs`);
   ort.env.wasm.wasmPaths = `${ORT}/`;
-  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, WALK, GRIP, HEAD_MAX_DIFF } = await import("./classify.js");
+  const { classifyPose, classifyMotion, motion, makeRepCounter, makeTracker, makeOneEuro, limbStates, classifyExpression, summarizeObjects, makeBoxTracker, decodeYolo, boxAt, faceCrop, groupCaptures, handCrop, smoothScores, heldCandidates, faceSignature, makeHeadIds, handPose, assignHands, makeStateLog, toCsv, makeTraitAverager, motionStats, handStats, JUMP, WALK, GRIP, HEAD_MAX_DIFF } = await import("./classify.js");
   // Debug button: shows each measurement next to the threshold it's compared with (thresholds live in classify.js).
   let debug = false;
   $("debug").onclick = e => { debug = !debug; e.currentTarget.setAttribute("aria-pressed", debug); };
@@ -144,7 +144,8 @@ try {
     }
   };
   status.textContent = "Loading body model…";
-  const pose = await load(PoseLandmarker, "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", { numPoses: PERSON_COLORS.length });
+  // "full" is more accurate than "lite"; on slow machines swap back to pose_landmarker_lite (same path pattern).
+  const pose = await load(PoseLandmarker, "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task", { numPoses: PERSON_COLORS.length });
   status.textContent = "Loading face model…";
   const face = await load(FaceLandmarker, "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 4, outputFaceBlendshapes: true });
   status.textContent = "Loading hand model…";
@@ -267,12 +268,17 @@ try {
     for (const [k, p] of track(res.landmarks, now).entries()) { // same order as res.landmarks
       p.hist ??= []; p.speed ??= 0;
       p.squats ??= makeRepCounter("Squat", "Standing"); p.jumps ??= makeRepCounter("Jumping");
-      p.speed = 0.8 * p.speed + 0.2 * motion(p.hist.at(-1)?.lm, p.lm); // smoothed so jitter doesn't flip the label
-      p.hist.push({ t: now, lm: p.lm });
+      // Per-person jitter filters live on the track, so they go away with it; world landmarks (3D, meters) are for joint angles.
+      p.smooth ??= makeOneEuro(); p.wsmooth ??= makeOneEuro();
+      // Jump/walk history stays raw: those checks have their own medians and dead bands, and smoothing shaved jump peaks.
+      const raw = p.lm; p.lm = p.smooth(raw, now);
+      const world = res.worldLandmarks?.[k] && p.wsmooth(res.worldLandmarks[k], now);
+      p.speed = 0.8 * p.speed + 0.2 * motion(p.hist.at(-1)?.lm, raw); // smoothed so jitter doesn't flip the label
+      p.hist.push({ t: now, lm: raw });
       while (now - p.hist[0].t > WINDOW_MS) p.hist.shift();
 
-      const posture = classifyPose(p.lm), move = classifyMotion(p.hist), label = move ?? posture;
-      const squats = p.squats(posture), jumps = p.jumps(move), limbs = limbStates(p.lm);
+      const posture = classifyPose(p.lm, world), move = classifyMotion(p.hist), label = move ?? posture;
+      const squats = p.squats(posture), jumps = p.jumps(move), limbs = limbStates(p.lm, world);
       const color = PERSON_COLORS[(p.id - 1) % PERSON_COLORS.length];
       // Skeletons take the id of the person box around their hips, so both views agree.
       const hx = (p.lm[23].x + p.lm[24].x) / 2 * W, hy = (p.lm[23].y + p.lm[24].y) / 2 * H;
